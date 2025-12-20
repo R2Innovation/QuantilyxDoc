@@ -74,6 +74,16 @@ find_package(Poppler REQUIRED COMPONENTS Qt5)
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Find PkgConfig to help locate QPDF
+find_package(PkgConfig REQUIRED)
+
+# Find QPDF library
+pkg_check_modules(QPDF REQUIRED IMPORTED_TARGET qpdf)
+
+# Add the QPDF include directories and link the library to your main executable
+# Assuming your main target is called 'quantilyxdoc'
+target_link_libraries(quantilyxdoc PRIVATE PkgConfig::QPDF)
+
 # Optional packages
 if(ENABLE_OCR_TESSERACT)
     find_package(Tesseract)

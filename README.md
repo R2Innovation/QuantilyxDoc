@@ -13,6 +13,7 @@
 ## 📋 Overview
 
 QuantilyxDoc is a powerful, feature-rich document editor designed to give you complete control over your PDF and document files. Built on the principle of **document liberation**, QuantilyxDoc helps you view, edit, convert, and manage documents without artificial restrictions.
+QuantilyxDoc's original vision was to liberate us from the proprietary software Abobe Acrobat Pro.
 
 ### 🎯 Key Philosophy
 
@@ -118,6 +119,8 @@ sudo apt-get install \
     libpoppler-qt5-dev \
     libssl-dev \
     zlib1g-dev \
+    qpdf \
+    libqpdf-dev \
     tesseract-ocr \
     libtesseract-dev
 
@@ -300,7 +303,7 @@ See [LICENSE](LICENSE) for the full license text.
 **Developer**: R² Innovative Software Development Team  
 **Company**: R² Innovative Software  
 **Motto**: "Where innovation is the key to success"  
-**Website**: [github.com/R-Square-Innovative-Software](https://github.com/R-Square-Innovative-Software)
+**Website**: [https://r2innovation.github.io/](https://r2innovation.github.io/)
 
 ### Third-Party Libraries
 
