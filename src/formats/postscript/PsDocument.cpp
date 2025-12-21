@@ -253,9 +253,17 @@ int PsDocument::pageCount() const
 Page* PsDocument::page(int index) const
 {
     if (index >= 0 && index < d->pages.size()) {
-        // return d->pages[index].get(); // Placeholder - requires PsPage implementation
+         return d->pages[index].get(); // Placeholder - requires PsPage implementation
         LOG_DEBUG("PsDocument::page: Requested page " << index << ", but PsPage not yet implemented.");
         return nullptr; // For now, return null until PsPage is ready
+    }
+    return nullptr;
+}
+
+Page* PsDocument::page(int index) const
+{
+    if (index >= 0 && index < d->pages.size()) {
+        return d->pages[index].get(); // Now returns a valid PsPage*
     }
     return nullptr;
 }

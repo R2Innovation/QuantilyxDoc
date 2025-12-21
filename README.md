@@ -122,7 +122,9 @@ sudo apt-get install \
     qpdf \
     libqpdf-dev \
     tesseract-ocr \
-    libtesseract-dev
+    libtesseract-dev \
+    ghostscript \
+    libgs-dev
 
 # Optional dependencies
 sudo apt-get install \
