@@ -20,9 +20,9 @@
 #include <QMutex>
 #include <QMutexLocker>
 #include <QApplication>
-#include <QStyle>
-#include <QStyleOption>
+#include <QDesktopWidget>
 #include <QPainter>
+#include <QStyleOption>
 #include <QDebug>
 
 namespace QuantilyxDoc {
@@ -37,119 +37,130 @@ public:
     QWidget* contentWidget;
     QGridLayout* contentLayout;
     QButtonGroup* buttonGroup;
-    QList<QuickAction> actions;
-    QHash<QString, int> actionIdToIndex; // Map ID -> index in actions list for quick lookup
-    int maxVisibleActionsVal;
-    bool adaptiveModeVal;
-    mutable QMutex mutex; // Protect access to the actions list during updates
+    QList<QuickAction> allActions; // List of all registered actions
+    QHash<QString, int> actionIdToIndex; // Map ID -> index in allActions list for quick lookup
+    QList<int> visibleActionIndices; // Indices of actions currently shown in the UI (based on favorites, frequency, or adaptive mode)
+    int maxVisibleActionsVal; // Maximum number of action buttons to show
+    bool adaptiveModeVal; // Whether the panel adapts based on usage frequency
+    mutable QMutex mutex; // Protect access to the action lists during concurrent access (e.g., registration, usage tracking)
 
-    // Helper to update the UI based on the current list of actions and visibility settings
+    // Helper to update the UI based on the current list of visible actions
     void updateUi() {
         QMutexLocker locker(&mutex); // Lock during UI update
 
-        // Clear existing buttons from layout (but don't delete the QToolButtons themselves yet)
+        // Clear existing buttons from layout (but keep the QToolButton objects alive in the allActions list)
         QLayoutItem* child;
         while ((child = contentLayout->takeAt(0)) != nullptr) {
-            delete child->widget(); // Delete the actual QToolButton widget
-            delete child;          // Delete the layout item
+            // Do NOT delete the widget here, it's owned by the QToolButton itself or the button group.
+            delete child->widget(); // This deletes the actual QToolButton widget added to the layout
+            delete child;          // Delete the layout item wrapper
         }
 
-        // Determine which actions to show
-        // If adaptive, sort by usage count or last used time and pick top N
-        // If not adaptive, show all favorites first, then others up to max.
-        QList<QuickAction> actionsToShow;
+        // Determine which actions to show based on adaptive mode or favorites
+        QList<int> actionsToShowIndices;
         if (adaptiveModeVal) {
-            // Create a copy and sort by usage/frequency/last used
-            QList<QuickAction> sortedActions = actions;
+            // Sort all actions by usage count or last used time (descending)
+            QList<QuickAction> sortedActions = allActions;
             std::sort(sortedActions.begin(), sortedActions.end(), [](const QuickAction& a, const QuickAction& b) {
-                // Prioritize by usage count first, then by last used time
                 if (a.usageCount != b.usageCount) {
-                    return a.usageCount > b.usageCount;
+                    return a.usageCount > b.usageCount; // Prioritize by usage count first
                 }
-                return a.lastUsed > b.lastUsed;
+                return a.lastUsed > b.lastUsed; // Then by last used time
             });
-            actionsToShow = sortedActions.mid(0, maxVisibleActionsVal);
-        } else {
-            // Show favorites first, then others
-            for (const auto& action : actions) {
-                if (action.isFavorite) {
-                    actionsToShow.append(action);
+            // Take the first N (maxVisibleActionsVal) actions from the sorted list
+            for (int i = 0; i < qMin(sortedActions.size(), maxVisibleActionsVal); ++i) {
+                QString id = sortedActions[i].id;
+                int index = actionIdToIndex.value(id, -1); // Find its index in the original allActions list
+                if (index != -1) {
+                    actionsToShowIndices.append(index);
                 }
             }
-            int remainingSlots = maxVisibleActionsVal - actionsToShow.size();
-            if (remainingSlots > 0) {
-                for (const auto& action : actions) {
-                    if (!action.isFavorite && actionsToShow.size() < maxVisibleActionsVal) {
-                        actionsToShow.append(action);
-                    }
+        } else {
+            // Show favorites first, then others up to max
+            QList<int> favIndices;
+            QList<int> otherIndices;
+            for (int i = 0; i < allActions.size(); ++i) {
+                if (allActions[i].isFavorite) {
+                    favIndices.append(i);
+                } else {
+                    otherIndices.append(i);
                 }
+            }
+            actionsToShowIndices.append(favIndices);
+            int remainingSlots = maxVisibleActionsVal - favIndices.size();
+            if (remainingSlots > 0) {
+                actionsToShowIndices.append(otherIndices.mid(0, remainingSlots));
             }
         }
+
+        visibleActionIndices = actionsToShowIndices;
 
         // Create and add buttons for the actions to show
-        int rows = 0;
-        int cols = 4; // Fixed number of columns for grid layout
+        int rows = qMax(1, visibleActionIndices.size() / 4 + (visibleActionIndices.size() % 4 > 0 ? 1 : 0)); // 4 columns
+        int cols = 4;
         int currentRow = 0;
         int currentCol = 0;
 
-        for (const auto& action : actionsToShow) {
-            QToolButton* button = new QToolButton(q);
-            button->setIcon(action.icon);
-            button->setIconSize(QSize(24, 24)); // Standard icon size for quick actions
-            button->setText(action.title);
-            button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon); // Icon above text
-            button->setToolTip(action.description); // Show description as tooltip
-            button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-            button->setMinimumHeight(50); // Ensure buttons are tall enough
+        for (int idx : visibleActionIndices) {
+            if (idx >= 0 && idx < allActions.size()) {
+                const QuickAction& action = allActions[idx];
 
-            // Store the action ID in the button's object name for identification
-            button->setObjectName("QuickActionBtn_" + action.id);
+                QToolButton* button = new QToolButton(q);
+                button->setIcon(action.icon);
+                button->setIconSize(QSize(32, 32)); // Standard icon size for quick actions
+                // button->setText(action.title); // Show text? Maybe only on hover or in a specific mode.
+                button->setToolTip(action.description); // Show description as tooltip
+                button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+                button->setMinimumHeight(50); // Ensure buttons are tall enough
 
-            // Add to layout
-            contentLayout->addWidget(button, currentRow, currentCol);
-            currentCol++;
-            if (currentCol >= cols) {
-                currentCol = 0;
-                currentRow++;
+                // Store the action index in the button's object name or user property for identification
+                button->setProperty("actionIndex", idx);
+
+                // Add to layout
+                contentLayout->addWidget(button, currentRow, currentCol);
+                currentCol++;
+                if (currentCol >= cols) {
+                    currentCol = 0;
+                    currentRow++;
+                }
+
+                // Add to button group (useful for exclusive selection if needed, but usually not for quick actions)
+                // buttonGroup->addButton(button, idx);
+
+                // Connect button click to the action's handler
+                connect(button, &QToolButton::clicked, [this, idx]() {
+                    executeAction(idx);
+                });
             }
-
-            // Connect button click to the action's handler
-            connect(button, &QToolButton::clicked, [this, id = action.id]() {
-                executeAction(id);
-            });
         }
 
-        // Add stretch item to push buttons towards the top-left if fewer than grid capacity
+        // Add a spacer item to push buttons towards the top-left if fewer than grid capacity are shown
         contentLayout->addItem(new QSpacerItem(0, 0, QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding), currentRow, 0, 1, cols);
 
-        LOG_DEBUG("QuickActionsPanel: Updated UI with " << actionsToShow.size() << " visible actions.");
+        LOG_DEBUG("QuickActionsPanel: Updated UI with " << visibleActionIndices.size() << " visible actions.");
     }
 
-    // Helper to execute an action by its ID
-    void executeAction(const QString& id) {
+    // Helper to execute an action by its index in the allActions list
+    void executeAction(int index) {
         QMutexLocker locker(&mutex);
-        auto it = actionIdToIndex.constFind(id);
-        if (it != actionIdToIndex.constEnd()) {
-            int index = it.value();
-            if (index >= 0 && index < actions.size()) {
-                QuickAction& action = actions[index];
-                LOG_INFO("QuickActionsPanel: Executing quick action '" << action.title << "' (ID: " << action.id << ")");
-                if (action.handler) {
-                    action.handler(); // Execute the associated function
-                }
-                // Update usage statistics
-                action.usageCount++;
-                action.lastUsed = QDateTime::currentDateTime();
-                emit q->actionExecuted(id);
+        if (index >= 0 && index < allActions.size()) {
+            QuickAction& action = allActions[index];
+            LOG_INFO("QuickActionsPanel: Executing quick action '" << action.title << "' (ID: " << action.id << ", Index: " << index << ")");
+            if (action.handler) {
+                action.handler(); // Execute the associated function
+            }
+            // Update usage statistics
+            action.usageCount++;
+            action.lastUsed = QDateTime::currentDateTime();
+            emit q->actionExecuted(action.id);
 
-                // If adaptive mode is on, the UI might need a slight delay/update to reflect new usage stats
-                if (adaptiveModeVal) {
-                    // Use a single shot timer to avoid blocking the UI thread during button click
-                    QTimer::singleShot(0, [this]() { updateUi(); });
-                }
+            // If adaptive mode is on, the UI might need a slight delay/update to reflect new usage stats
+            if (adaptiveModeVal) {
+                // Use a single shot timer to avoid blocking the UI thread during button click
+                QTimer::singleShot(0, [this]() { updateUi(); });
             }
         } else {
-            LOG_WARN("QuickActionsPanel::executeAction: Action ID not found: " << id);
+            LOG_WARN("QuickActionsPanel::executeAction: Action index out of bounds: " << index);
         }
     }
 };
@@ -204,17 +215,17 @@ void QuickActionsPanel::addAction(const QString& id, const QString& title, const
     QMutexLocker locker(&d->mutex);
 
     // Check for duplicates
-    auto existingIt = std::find_if(d->actions.begin(), d->actions.end(),
+    auto existingIt = std::find_if(d->allActions.begin(), d->allActions.end(),
                                    [&id](const QuickAction& act) { return act.id == id; });
-    if (existingIt != d->actions.end()) {
+    if (existingIt != d->allActions.end()) {
         LOG_WARN("QuickActionsPanel::addAction: Action with ID already exists, overwriting: " << id);
-        int index = std::distance(d->actions.begin(), existingIt);
+        int index = std::distance(d->allActions.begin(), existingIt);
         d->actionIdToIndex.remove(existingIt->id); // Remove old ID mapping
         *existingIt = QuickAction{id, title, description, icon, std::move(handler), isFavorite, 0, QDateTime()}; // Replace
         d->actionIdToIndex.insert(id, index); // Add new ID mapping
     } else {
-        int newIndex = d->actions.size();
-        d->actions.append(QuickAction{id, title, description, icon, std::move(handler), isFavorite, 0, QDateTime()});
+        int newIndex = d->allActions.size();
+        d->allActions.append(QuickAction{id, title, description, icon, std::move(handler), isFavorite, 0, QDateTime()});
         d->actionIdToIndex.insert(id, newIndex);
     }
 
@@ -230,12 +241,12 @@ void QuickActionsPanel::removeAction(const QString& id)
 {
     QMutexLocker locker(&d->mutex);
 
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    if (it != d->actions.end()) {
-        int index = std::distance(d->actions.begin(), it);
+    if (it != d->allActions.end()) {
+        int index = std::distance(d->allActions.begin(), it);
         d->actionIdToIndex.remove(it->id);
-        d->actions.erase(it);
+        d->allActions.erase(it);
 
         // Shift indices in the map for items after the removed one
         for (auto mapIt = d->actionIdToIndex.begin(); mapIt != d->actionIdToIndex.end(); ++mapIt) {
@@ -256,15 +267,15 @@ void QuickActionsPanel::removeAction(const QString& id)
 QList<QuickAction> QuickActionsPanel::actions() const
 {
     QMutexLocker locker(&d->mutex);
-    return d->actions; // Returns a copy
+    return d->allActions; // Returns a copy
 }
 
 void QuickActionsPanel::setActionAsFavorite(const QString& id, bool favorite)
 {
     QMutexLocker locker(&d->mutex);
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    if (it != d->actions.end()) {
+    if (it != d->allActions.end()) {
         it->isFavorite = favorite;
         LOG_DEBUG("QuickActionsPanel: Set action '" << id << "' as favorite: " << favorite);
 
@@ -280,17 +291,17 @@ void QuickActionsPanel::setActionAsFavorite(const QString& id, bool favorite)
 bool QuickActionsPanel::isActionFavorite(const QString& id) const
 {
     QMutexLocker locker(&d->mutex);
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    return (it != d->actions.end() && it->isFavorite);
+    return (it != d->allActions.end() && it->isFavorite);
 }
 
 void QuickActionsPanel::promoteActionAsFrequent(const QString& id)
 {
     QMutexLocker locker(&d->mutex);
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    if (it != d->actions.end()) {
+    if (it != d->allActions.end()) {
         it->usageCount++;
         it->lastUsed = QDateTime::currentDateTime();
         LOG_DEBUG("QuickActionsPanel: Promoted action '" << id << "' as frequent (usage: " << it->usageCount << ").");
@@ -307,17 +318,17 @@ void QuickActionsPanel::promoteActionAsFrequent(const QString& id)
 int QuickActionsPanel::actionUsageCount(const QString& id) const
 {
     QMutexLocker locker(&d->mutex);
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    return (it != d->actions.end()) ? it->usageCount : 0;
+    return (it != d->allActions.end()) ? it->usageCount : 0;
 }
 
 QDateTime QuickActionsPanel::actionLastUsed(const QString& id) const
 {
     QMutexLocker locker(&d->mutex);
-    auto it = std::find_if(d->actions.begin(), d->actions.end(),
+    auto it = std::find_if(d->allActions.begin(), d->allActions.end(),
                            [&id](const QuickAction& act) { return act.id == id; });
-    return (it != d->actions.end()) ? it->lastUsed : QDateTime();
+    return (it != d->allActions.end()) ? it->lastUsed : QDateTime();
 }
 
 void QuickActionsPanel::setMaxVisibleActions(int maxCount)

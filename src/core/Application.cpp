@@ -7,450 +7,346 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  */
-
 #include "Application.h"
 #include "Logger.h"
 #include "ConfigManager.h"
-#include "Document.h"
-#include "../ui/MainWindow.h"
-#include "../plugins/PluginInterface.h"
-#include "utils/Version.h"
-
+#include "Settings.h"
+#include "RecentFiles.h"
+#include "BackupManager.h"
+#include "CrashHandler.h"
+#include "ProfileManager.h"
+#include "MetadataDatabase.h"
+#include "search/FullTextIndex.h"
+#include "automation/MacroRecorder.h"
+#include "automation/ScriptingEngine.h"
+#include "security/PasswordRemover.h"
+#include "security/RestrictionBypass.h"
+#include "ocr/OcrEngine.h"
+#include "ui/SplashScreen.h"
+#include "ui/MainWindow.h"
 #include <QDir>
-#include <QFile>
 #include <QStandardPaths>
-#include <QPluginLoader>
-#include <QLocalSocket>
-#include <QLocalServer>
-#include <QDataStream>
-#include <QCoreApplication>
+#include <QFileInfo>
+#include <QCommandLineParser>
+#include <QTimer>
+#include <QMessageBox>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QMetaType> // For registering custom types if needed
+#include <QDebug>
+#include <QElapsedTimer> // For timing initialization steps
 
 namespace QuantilyxDoc {
 
-// Private implementation
-class Application::Private
-{
-public:
-    Private() : mainWindow(nullptr), localServer(nullptr) {}
-
-    MainWindow* mainWindow;
-    QMap<QString, PluginInterface*> plugins;
-    QList<Document*> documents;
-    QLocalServer* localServer;
-    
-    QString tempDir;
-    QString cacheDir;
-    QString configDir;
-    QString dataDir;
-    QString pluginsDir;
-    QString translationsDir;
-    
-    QMap<QString, bool> ocrEngines;
-    
-    static const QString IPC_SERVER_NAME;
-};
-
-const QString Application::Private::IPC_SERVER_NAME = "quantilyxdoc-ipc";
-
-// Static instance
+// Static instance pointer
 Application* Application::s_instance = nullptr;
 
-Application::Application()
-    : QObject(nullptr)
-    , d(new Private())
+Application& Application::instance()
 {
-    LOG_INFO("Application instance created");
-    initializeDirectories();
-    setupIPC();
+    if (!s_instance) {
+        qCritical("Application::instance: Application object not created yet!");
+        // Should not happen if main.cpp creates Application first.
+        // Maybe throw an exception or return a dummy instance? For now, assert.
+        Q_ASSERT(s_instance);
+    }
+    return *s_instance;
+}
+
+Application::Application(int& argc, char** argv)
+    : QApplication(argc, argv)
+    , d(new Private(this))
+{
+    s_instance = this; // Set the static instance pointer early
+
+    setApplicationName("QuantilyxDoc");
+    setApplicationVersion("0.1.0-alpha"); // Placeholder version
+    setOrganizationName("R² Innovative Software");
+    setOrganizationDomain("r2innovative.software"); // Placeholder domain
+    // setWindowIcon(QIcon(":/icons/app_icon.png")); // Load from resources
+
+    LOG_INFO("QuantilyxDoc Application starting (Version " << applicationVersion() << ").");
+
+    // Register custom types if any (e.g., for signals/slots across threads)
+    // qRegisterMetaType<MyCustomType>("MyCustomType");
+
+    LOG_INFO("Application object created.");
 }
 
 Application::~Application()
 {
-    LOG_INFO("Application instance destroyed");
-    
-    emit aboutToQuit();
-    
-    // Cleanup plugins
-    for (auto* plugin : d->plugins.values()) {
-        delete plugin;
-    }
-    d->plugins.clear();
-    
-    // Cleanup documents
-    qDeleteAll(d->documents);
-    d->documents.clear();
-    
-    // Cleanup IPC
-    if (d->localServer) {
-        d->localServer->close();
-        delete d->localServer;
-    }
-}
+    LOG_INFO("Application object destruction started.");
 
-Application* Application::instance()
-{
-    if (!s_instance) {
-        s_instance = new Application();
-    }
-    return s_instance;
-}
+    // --- Shutdown Sequence ---
+    // 1. Save application state (settings, recent files, profiles, metadata DB, FTS index)
+    Settings::instance().save();
+    RecentFiles::instance().save();
+    // ProfileManager::instance().saveCurrentProfile(); // Assuming this method exists
+    // MetadataDatabase::instance().commit(); // Assuming this flushes changes to disk
+    // FullTextIndex::instance().commit(); // Assuming this flushes changes to disk
 
-bool Application::isAlreadyRunning()
-{
-    QLocalSocket socket;
-    socket.connectToServer(Private::IPC_SERVER_NAME);
-    
-    if (socket.waitForConnected(500)) {
-        socket.disconnectFromServer();
-        return true;
-    }
-    
-    return false;
-}
+    // 2. Stop background services/processes (OCR, MacroRecorder, ScriptingEngine if running scripts, etc.)
+    // OcrEngine::instance().shutdown(); // Assuming a shutdown method exists
+    // MacroRecorder::instance().stopRecording(); // If currently recording
+    // ScriptingEngine::instance().shutdown(); // If running scripts
 
-bool Application::sendFilesToExistingInstance(const QStringList& files)
-{
-    if (files.isEmpty()) {
-        return false;
-    }
-    
-    QLocalSocket socket;
-    socket.connectToServer(Private::IPC_SERVER_NAME);
-    
-    if (!socket.waitForConnected(1000)) {
-        LOG_ERROR("Failed to connect to existing instance");
-        return false;
-    }
-    
-    // Send files list
-    QByteArray data;
-    QDataStream stream(&data, QIODevice::WriteOnly);
-    stream << files;
-    
-    socket.write(data);
-    socket.flush();
-    socket.waitForBytesWritten(1000);
-    socket.disconnectFromServer();
-    
-    LOG_INFO("Sent " << files.size() << " files to existing instance");
-    return true;
+    // 3. Close all documents gracefully
+    // QList<Document*> docsToClose = openDocuments(); // Hypothetical method to get list
+    // for (Document* doc : docsToClose) {
+    //     if (doc->isModified()) {
+    //         // Prompt user to save/discard changes
+    //         // This might require interaction with MainWindow or a headless prompt mechanism.
+    //         // For now, assume save/discard is handled by MainWindow's closeEvent.
+    //         // We'll just remove them from the manager, which might trigger save prompts in MainWindow.
+    //         // DocumentManager::instance().closeDocument(doc); // Hypothetical manager
+    //     }
+    //     // Document's destructor should handle cleanup if not managed elsewhere.
+    // }
+
+    // 4. Uninstall crash handler
+    CrashHandler::instance().uninstall();
+
+    LOG_INFO("Application object destruction finished.");
 }
 
 bool Application::initialize()
 {
-    LOG_INFO("Initializing application...");
-    
-    // Create necessary directories
-    QDir().mkpath(d->tempDir);
-    QDir().mkpath(d->cacheDir);
-    QDir().mkpath(d->configDir);
-    QDir().mkpath(d->dataDir);
-    QDir().mkpath(d->pluginsDir);
-    
-    LOG_INFO("Application initialized successfully");
-    return true;
-}
+    LOG_INFO("Starting application initialization...");
 
-void Application::loadPlugins()
-{
-    LOG_INFO("Loading plugins from: " << d->pluginsDir);
-    
-    ConfigManager& config = ConfigManager::instance();
-    bool autoLoad = config.getBool("Plugins", "auto_load_plugins", true);
-    
-    if (!autoLoad) {
-        LOG_INFO("Plugin auto-loading disabled");
-        return;
+    bool initSuccess = true;
+    QString initError;
+
+    // 1. Initialize Logger first (so other initializations can log)
+    if (!Logger::instance().initialize()) {
+        initError = "Failed to initialize Logger.";
+        initSuccess = false;
+        goto finalize_init; // Jump to cleanup/error handling
     }
-    
-    QDir pluginsDir(d->pluginsDir);
-    QStringList pluginFiles = pluginsDir.entryList(QDir::Files);
-    
-    int loadedCount = 0;
-    int failedCount = 0;
-    
-    for (const QString& fileName : pluginFiles) {
-        if (!fileName.endsWith(".so") && !fileName.endsWith(".dll") && !fileName.endsWith(".dylib")) {
-            continue;
-        }
-        
-        QString pluginPath = pluginsDir.absoluteFilePath(fileName);
-        if (loadPlugin(pluginPath)) {
-            loadedCount++;
-        } else {
-            failedCount++;
+
+    // 2. Initialize ConfigManager
+    if (initSuccess) {
+        if (!ConfigManager::instance().initialize()) {
+            initError = "Failed to initialize ConfigManager.";
+            initSuccess = false;
+            goto finalize_init;
         }
     }
-    
-    LOG_INFO("Loaded " << loadedCount << " plugins, " << failedCount << " failed");
-}
 
-bool Application::loadPlugin(const QString& pluginPath)
-{
-    QPluginLoader loader(pluginPath);
-    QObject* pluginObj = loader.instance();
-    
-    if (!pluginObj) {
-        QString error = loader.errorString();
-        LOG_ERROR("Failed to load plugin: " << pluginPath << " - " << error);
-        emit pluginLoadFailed(pluginPath, error);
-        return false;
+    // 3. Initialize Settings
+    if (initSuccess) {
+        Settings::instance().load(); // Load settings from file
+        // Any critical settings validation could happen here.
+        // If a critical setting is missing or invalid, set a default or fail.
     }
-    
-    PluginInterface* plugin = qobject_cast<PluginInterface*>(pluginObj);
-    if (!plugin) {
-        LOG_ERROR("Plugin does not implement PluginInterface: " << pluginPath);
-        emit pluginLoadFailed(pluginPath, "Invalid plugin interface");
-        return false;
-    }
-    
-    QString pluginName = plugin->name();
-    
-    // Check if plugin is enabled
-    ConfigManager& config = ConfigManager::instance();
-    QStringList enabledPlugins = config.getString("Plugins", "enabled_plugins", "").split(',');
-    
-    if (!enabledPlugins.isEmpty() && !enabledPlugins.contains(pluginName)) {
-        LOG_INFO("Plugin " << pluginName << " is disabled in configuration");
-        return false;
-    }
-    
-    // Initialize plugin
-    if (!plugin->initialize(this)) {
-        LOG_ERROR("Plugin initialization failed: " << pluginName);
-        emit pluginLoadFailed(pluginName, "Initialization failed");
-        return false;
-    }
-    
-    d->plugins.insert(pluginName, plugin);
-    LOG_INFO("Plugin loaded: " << pluginName << " v" << plugin->version());
-    emit pluginLoaded(pluginName);
-    
-    return true;
-}
 
-void Application::initializeOCR()
-{
-    LOG_INFO("Initializing OCR engines...");
-    
-    d->ocrEngines.clear();
-    
-#ifdef HAVE_TESSERACT
-    d->ocrEngines.insert("Tesseract", true);
-    LOG_INFO("Tesseract OCR available");
-#else
-    d->ocrEngines.insert("Tesseract", false);
-#endif
+    // 4. Initialize Crash Handler
+    if (initSuccess) {
+        if (!CrashHandler::instance().install()) {
+            LOG_WARN("Could not install crash handler.");
+            // Don't fail init for this, but log it.
+        }
+    }
 
-#ifdef HAVE_PADDLEOCR
-    d->ocrEngines.insert("PaddleOCR", true);
-    LOG_INFO("PaddleOCR available");
-#else
-    d->ocrEngines.insert("PaddleOCR", false);
-#endif
-    
-    if (d->ocrEngines.values().contains(true)) {
-        LOG_INFO("OCR engines initialized successfully");
+    // 5. Initialize Profile Manager
+    if (initSuccess) {
+        if (!ProfileManager::instance().initialize()) {
+            initError = "Failed to initialize ProfileManager.";
+            initSuccess = false;
+            goto finalize_init;
+        }
+    }
+
+    // 6. Initialize Recent Files
+    if (initSuccess) {
+        RecentFiles::instance().load();
+    }
+
+    // 7. Initialize Backup Manager (settings dependent)
+    if (initSuccess) {
+        // BackupManager::instance().setEnabled(Settings::instance().value<bool>("General/EnableAutoBackup", true));
+        // BackupManager::instance().setBackupDirectory(...);
+        // BackupManager::instance().initializeTimers(); // If needed
+    }
+
+    // 8. Initialize Metadata Database
+    if (initSuccess) {
+        QString dbPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/metadata.db";
+        QDir().mkpath(QFileInfo(dbPath).absolutePath()); // Ensure directory exists
+        if (!MetadataDatabase::instance().initialize(dbPath)) {
+            initError = "Failed to initialize MetadataDatabase.";
+            initSuccess = false;
+            goto finalize_init;
+        }
+    }
+
+    // 9. Initialize Full-Text Index
+    if (initSuccess) {
+        QString indexPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/fts_index";
+        QDir().mkpath(indexPath);
+        if (!FullTextIndex::instance().initialize(indexPath)) {
+            initError = "Failed to initialize FullTextIndex.";
+            initSuccess = false;
+            goto finalize_init;
+        }
+    }
+
+    // 10. Initialize Password Remover (finds tools like QPDF)
+    if (initSuccess) {
+        // PasswordRemover::instance().findExternalTool(); // Or initialize in its constructor if it does this automatically
+    }
+
+    // 11. Initialize Restriction Bypass (finds tools like QPDF)
+    if (initSuccess) {
+        // RestrictionBypass::instance().findExternalTool(); // Or initialize in its constructor
+    }
+
+    // 12. Initialize OCR Engine
+    if (initSuccess) {
+        QString lang = Settings::instance().value<QString>("Ocr/Language", "eng");
+        QString dataPath = Settings::instance().value<QString>("Ocr/TessDataPath", QString()); // Could be empty, uses default
+        if (!OcrEngine::instance().initialize(lang, dataPath)) {
+            // OCR is not critical for startup, warn and continue
+            LOG_WARN("Failed to initialize OCR Engine. OCR features will be unavailable.");
+            // initSuccess = true; // Keep initSuccess as true to allow the app to run without OCR
+        }
+    }
+
+    // 13. Initialize Macro Recorder
+    if (initSuccess) {
+        // MacroRecorder::instance(); // Singleton created/accessed, might initialize in constructor
+    }
+
+    // 14. Initialize Scripting Engine (optional at startup)
+    if (initSuccess) {
+        // QString scriptLanguage = Settings::instance().value<QString>("Scripting/Language", "python");
+        // if (!ScriptingEngine::instance().initialize(scriptLanguage)) {
+        //     LOG_WARN("Failed to initialize Scripting Engine. Scripting features will be unavailable.");
+        //     // initSuccess = true; // Keep initSuccess as true to allow the app to run without scripting
+        // }
+    }
+
+finalize_init:
+
+    if (!initSuccess) {
+        LOG_CRITICAL("Application initialization failed: " << initError);
+        // Could show a critical error dialog here before quitting, but QApplication isn't fully set up yet.
+        // A better place might be in main() after QApplication is created but before MainWindow.
+        // For now, log and return the failure status.
+        // QMessageBox::critical(nullptr, "Initialization Error", initError);
+        // exit(EXIT_FAILURE); // Or return false from main
     } else {
-        LOG_WARNING("No OCR engines available");
+        LOG_INFO("Application initialization completed successfully.");
+    }
+
+    d->initialized = initSuccess;
+    emit initializationComplete(initSuccess);
+    return initSuccess;
+}
+
+bool Application::isInitialized() const
+{
+    return d->initialized;
+}
+
+void Application::showSplashScreen()
+{
+    if (!d->splashScreen) {
+        d->splashScreen = new SplashScreen();
+    }
+    d->splashScreen->show();
+    processEvents(); // Ensure splash is painted
+    LOG_DEBUG("Splash screen shown.");
+}
+
+void Application::hideSplashScreen()
+{
+    if (d->splashScreen) {
+        d->splashScreen->hide();
+        LOG_DEBUG("Splash screen hidden.");
     }
 }
 
-const QMap<QString, PluginInterface*>& Application::plugins() const
+void Application::showMainWindow()
 {
-    return d->plugins;
-}
-
-PluginInterface* Application::getPlugin(const QString& name) const
-{
-    return d->plugins.value(name, nullptr);
-}
-
-bool Application::hasPlugin(const QString& name) const
-{
-    return d->plugins.contains(name);
-}
-
-QString Application::version()
-{
-    return QUANTILYXDOC_VERSION_STRING;
-}
-
-QString Application::buildDate()
-{
-    return __DATE__ " " __TIME__;
-}
-
-QString Application::homePage()
-{
-    return "https://github.com/R-Square-Innovative-Software/QuantilyxDoc";
-}
-
-QString Application::bugReportUrl()
-{
-    return "https://github.com/R-Square-Innovative-Software/QuantilyxDoc/issues";
-}
-
-QList<Document*> Application::openDocuments() const
-{
-    return d->documents;
-}
-
-void Application::registerDocument(Document* doc)
-{
-    if (!d->documents.contains(doc)) {
-        d->documents.append(doc);
-        LOG_INFO("Document registered: " << doc->filePath());
-        emit documentRegistered(doc);
+    if (!d->mainWindow) {
+        LOG_DEBUG("Creating MainWindow...");
+        d->mainWindow = new MainWindow();
     }
-}
-
-void Application::unregisterDocument(Document* doc)
-{
-    if (d->documents.removeOne(doc)) {
-        LOG_INFO("Document unregistered: " << doc->filePath());
-        emit documentUnregistered(doc);
+    if (d->splashScreen) {
+        d->splashScreen->finish(d->mainWindow); // Hide splash when main window is shown
+    } else {
+        d->mainWindow->show(); // Show main window directly if no splash
     }
+    LOG_DEBUG("MainWindow shown.");
 }
 
 MainWindow* Application::mainWindow() const
 {
-    return d->mainWindow;
+    return d->mainWindow.data(); // Use QPointer
 }
 
-void Application::setMainWindow(MainWindow* window)
+void Application::openFileFromCommandLine(const QString& filePath)
 {
-    d->mainWindow = window;
-}
-
-QString Application::tempDirectory() const
-{
-    return d->tempDir;
-}
-
-QString Application::cacheDirectory() const
-{
-    return d->cacheDir;
-}
-
-QString Application::configDirectory() const
-{
-    return d->configDir;
-}
-
-QString Application::dataDirectory() const
-{
-    return d->dataDir;
-}
-
-QString Application::pluginsDirectory() const
-{
-    return d->pluginsDir;
-}
-
-QString Application::translationsDirectory() const
-{
-    return d->translationsDir;
-}
-
-void Application::clearCaches()
-{
-    LOG_INFO("Clearing all caches...");
-    
-    QDir cacheDir(d->cacheDir);
-    cacheDir.removeRecursively();
-    cacheDir.mkpath(".");
-    
-    LOG_INFO("Caches cleared");
-}
-
-QMap<QString, bool> Application::ocrEnginesAvailable() const
-{
-    return d->ocrEngines;
-}
-
-void Application::initializeDirectories()
-{
-    // Temporary directory
-    d->tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + 
-                 "/quantilyxdoc";
-    
-    // Cache directory
-    d->cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    
-    // Configuration directory
-    d->configDir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) + 
-                   "/quantilyxdoc";
-    
-    // Data directory
-    d->dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    
-    // Plugins directory
-    QString userPluginsDir = d->dataDir + "/plugins";
-    QString systemPluginsDir = QCoreApplication::applicationDirPath() + 
-                               "/../lib/quantilyxdoc/plugins";
-    
-    // Prefer user plugins directory, fallback to system
-    if (QDir(userPluginsDir).exists()) {
-        d->pluginsDir = userPluginsDir;
+    if (d->mainWindow) {
+        d->mainWindow->openDocument(filePath); // Assuming MainWindow has this method
     } else {
-        d->pluginsDir = systemPluginsDir;
+        LOG_WARN("Application::openFileFromCommandLine: MainWindow not ready yet.");
+        // Could store the file path and open it once the main window is created.
+        d->pendingFileToOpen = filePath;
     }
-    
-    // Translations directory
-    d->translationsDir = QCoreApplication::applicationDirPath() + 
-                         "/../share/quantilyxdoc/translations";
-    
-    LOG_INFO("Directories initialized:");
-    LOG_INFO("  Temp: " << d->tempDir);
-    LOG_INFO("  Cache: " << d->cacheDir);
-    LOG_INFO("  Config: " << d->configDir);
-    LOG_INFO("  Data: " << d->dataDir);
-    LOG_INFO("  Plugins: " << d->pluginsDir);
-    LOG_INFO("  Translations: " << d->translationsDir);
 }
 
-void Application::setupIPC()
+QStringList Application::commandLineFiles() const
 {
-    // Remove any existing server
-    QLocalServer::removeServer(Private::IPC_SERVER_NAME);
-    
-    // Create local server for IPC
-    d->localServer = new QLocalServer(this);
-    
-    connect(d->localServer, &QLocalServer::newConnection, this, [this]() {
-        QLocalSocket* socket = d->localServer->nextPendingConnection();
-        
-        connect(socket, &QLocalSocket::readyRead, this, [this, socket]() {
-            QByteArray data = socket->readAll();
-            QDataStream stream(&data, QIODevice::ReadOnly);
-            QStringList files;
-            stream >> files;
-            
-            LOG_INFO("Received " << files.size() << " files from another instance");
-            
-            // Open files in main window
-            if (d->mainWindow) {
-                for (const QString& file : files) {
-                    d->mainWindow->openDocument(file);
-                }
-            }
-            
-            // Bring window to front
-            if (d->mainWindow) {
-                d->mainWindow->raise();
-                d->mainWindow->activateWindow();
-            }
-            
-            socket->disconnectFromServer();
-        });
-    });
-    
-    if (!d->localServer->listen(Private::IPC_SERVER_NAME)) {
-        LOG_WARNING("Failed to start IPC server: " << d->localServer->errorString());
-    } else {
-        LOG_INFO("IPC server started");
+    return d->filesFromCommandLine;
+}
+
+void Application::parseCommandLine()
+{
+    // This logic is typically in main.cpp, but could be moved here if Application owns it.
+    // For now, assume main.cpp passes the file list to openFileFromCommandLine or stores it.
+    // This is a simplification. A full implementation would involve QCommandLineParser.
+    // For now, we'll just log that this step happens.
+    LOG_DEBUG("Application: Command line parsing would happen here.");
+    // Example:
+    // QCommandLineParser parser;
+    // parser.addPositionalArgument("files", "Files to open.", "[files...]");
+    // parser.process(*this); // 'this' is QApplication
+    // d->filesFromCommandLine = parser.positionalArguments();
+}
+
+void Application::handleStartupTasks()
+{
+    // Perform tasks that happen after the UI is ready but before full user interaction.
+    // Examples:
+    // - Check for updates (if enabled in settings)
+    // - Load last opened documents (if enabled in settings)
+    // - Initialize background services that don't require immediate UI feedback
+
+    LOG_DEBUG("Application: Handling startup tasks...");
+
+    // Example: Check for updates
+    bool checkUpdates = Settings::instance().value<bool>("General/CheckForUpdates", true);
+    if (checkUpdates) {
+        QTimer::singleShot(5000, this, &Application::checkForUpdates); // Check after 5 seconds
     }
+
+    // Example: Load last session (last opened files)
+    bool loadLastSession = Settings::instance().value<bool>("General/LoadLastSession", true);
+    if (loadLastSession && !d->pendingFileToOpen.isEmpty()) {
+        // MainWindow would handle loading the list of files
+        // mainWindow()->loadSession(RecentFiles::instance().lastSessionFiles());
+        openFileFromCommandLine(d->pendingFileToOpen); // Open the first one specified on command line
+    }
+
+    LOG_DEBUG("Application: Finished startup tasks.");
+}
+
+void Application::checkForUpdates()
+{
+    LOG_DEBUG("Application: Checking for updates... (Stub implementation)");
+    // This would involve network requests, comparing versions, prompting user, etc.
+    // For now, just log.
+    // Could emit a signal updateCheckFinished(bool hasUpdate, QString newVersion, QString downloadUrl);
 }
 
 } // namespace QuantilyxDoc

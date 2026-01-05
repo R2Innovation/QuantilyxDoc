@@ -9,7 +9,8 @@
  */
 #include "CrashHandler.h"
 #include "Logger.h"
-#include "utils/FileUtils.h" // Assuming this exists
+#include "Settings.h"
+#include "utils/FileUtils.h" // Assuming this exists for path operations
 #include <QStandardPaths>
 #include <QDir>
 #include <QDateTime>
@@ -18,66 +19,13 @@
 #include <QCoreApplication>
 #include <QThread>
 #include <QDebug>
-
-// Platform-specific includes for crash handling
-#ifdef Q_OS_WIN
-#include <windows.h>
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
-#elif defined(Q_OS_UNIX) && !defined(Q_OS_MAC) // Linux, BSD, etc.
-#include <signal.h>
-#include <execinfo.h>
-#include <unistd.h>
-#include <sys/resource.h> // For core dump size limits
-#endif
+#include <signal.h> // For POSIX signals (Linux/macOS)
+#include <setjmp.h> // For setjmp/longjmp (not recommended for C++, use exceptions)
+#include <exception> // For standard C++ exceptions
+// #include <windows.h> // For Windows-specific crash handling (e.g., SetUnhandledExceptionFilter)
+// #include <dbghelp.h> // For Windows minidump generation (requires linking to dbghelp.lib)
 
 namespace QuantilyxDoc {
-
-class CrashHandler::Private {
-public:
-    Private(CrashHandler* q_ptr)
-        : q(q_ptr), installed(false), enabled(true), dumpDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/crash_dumps") {}
-
-    CrashHandler* q;
-    mutable QMutex mutex; // Protect state changes
-    bool installed;
-    bool enabled;
-    QDir dumpDir;
-    QString reporterPath;
-    CrashInfo lastCrash;
-
-    // Platform-specific handler setup/teardown
-#ifdef Q_OS_WIN
-    static LONG WINAPI winExceptionHandler(EXCEPTION_POINTERS* ExceptionInfo);
-    static bool setupWindowsHandler();
-    static bool teardownWindowsHandler();
-#elif defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
-    static void unixSignalHandler(int sig);
-    static bool setupUnixHandler();
-    static bool teardownUnixHandler();
-#endif
-
-    // Helper to create dump directory
-    bool ensureDumpDirExists() {
-        if (!dumpDir.exists()) {
-            return dumpDir.mkpath(".");
-        }
-        return true;
-    }
-
-    // Helper to get OS info string
-    QString getOSInfo() const {
-#ifdef Q_OS_WIN
-        return "Windows";
-#elif defined(Q_OS_MAC)
-        return "macOS";
-#elif defined(Q_OS_LINUX)
-        return "Linux";
-#else
-        return "Unknown Unix";
-#endif
-    }
-};
 
 // Static instance pointer
 CrashHandler* CrashHandler::s_instance = nullptr;
@@ -94,334 +42,232 @@ CrashHandler::CrashHandler(QObject* parent)
     : QObject(parent)
     , d(new Private(this))
 {
-    // Ensure dump directory exists on construction
-    d->ensureDumpDirExists();
-    LOG_INFO("CrashHandler initialized. Dump directory: " << d->dumpDir.absolutePath());
+    LOG_INFO("CrashHandler created.");
 }
 
 CrashHandler::~CrashHandler()
 {
     uninstall(); // Ensure handler is uninstalled on destruction
+    LOG_INFO("CrashHandler destroyed.");
 }
 
 bool CrashHandler::install()
 {
     QMutexLocker locker(&d->mutex);
-    if (d->installed || !d->enabled) return false;
+    if (d->handlerInstalled) {
+        LOG_WARN("CrashHandler::install: Handler is already installed.");
+        return true;
+    }
 
-    bool success = false;
+    LOG_INFO("Installing crash handler...");
+
+    bool success = true;
+    d->crashDumpPathStr = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/crash_dumps";
+    QDir().mkpath(d->crashDumpPathStr); // Ensure directory exists
+
 #ifdef Q_OS_WIN
-    success = d->setupWindowsHandler();
-#elif defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
-    success = d->setupUnixHandler();
+    // --- Windows-specific crash handling ---
+    // Use SetUnhandledExceptionFilter
+    SetUnhandledExceptionFilter(&CrashHandler::Private::windowsExceptionHandler);
+    LOG_DEBUG("CrashHandler: Installed Windows unhandled exception filter.");
+    // Note: Minidump generation requires more setup (SymInitialize, MiniDumpWriteDump).
+    // This is complex and often handled by external libraries like Breakpad or Crashpad.
+    // For now, we'll just log the crash attempt.
+    // d->minidumpEnabled = Settings::instance().value<bool>("CrashReporting/EnableMiniDump", true);
+    d->minidumpEnabled = false; // Disable for now without proper library integration
+    if (d->minidumpEnabled) {
+        // Initialize DbgHelp if minidump is enabled
+        // SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+        LOG_INFO("CrashHandler: Minidump generation is enabled (requires DbgHelp library integration).");
+    }
+#elif defined(Q_OS_UNIX) // Covers Linux, macOS, BSD
+    // --- Unix/Linux/macOS-specific crash handling ---
+    // Install signal handlers for common crash signals
+    signal(SIGSEGV, &CrashHandler::Private::posixSignalHandler); // Segmentation fault
+    signal(SIGABRT, &CrashHandler::Private::posixSignalHandler); // Abort signal (e.g., from assert)
+    signal(SIGFPE, &CrashHandler::Private::posixSignalHandler); // Floating-point exception
+    signal(SIGILL, &CrashHandler::Private::posixSignalHandler); // Illegal instruction
+    // SIGBUS might also be relevant on some Unix systems
+    LOG_DEBUG("CrashHandler: Installed POSIX signal handlers for SEGV, ABRT, FPE, ILL.");
+#else
+    LOG_WARN("CrashHandler: No native crash handler available for this platform. Crashes may not be caught.");
+    success = false; // Or keep success = true if the handler is optional/non-critical
 #endif
+
     if (success) {
-        d->installed = true;
-        LOG_INFO("Crash handler installed.");
+        d->handlerInstalled = true;
+        LOG_INFO("Crash handler installed successfully.");
+        emit handlerInstalled(true);
     } else {
         LOG_ERROR("Failed to install crash handler.");
+        emit handlerInstalled(false);
     }
     return success;
 }
 
-bool CrashHandler::uninstall()
+void CrashHandler::uninstall()
 {
     QMutexLocker locker(&d->mutex);
-    if (!d->installed) return true;
+    if (!d->handlerInstalled) {
+        LOG_DEBUG("CrashHandler::uninstall: Handler was not installed.");
+        return;
+    }
 
-    bool success = true;
+    LOG_INFO("Uninstalling crash handler...");
+
 #ifdef Q_OS_WIN
-    success = d->teardownWindowsHandler();
-#elif defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
-    success = d->teardownUnixHandler();
+    SetUnhandledExceptionFilter(nullptr);
+    if (d->minidumpEnabled) {
+        // SymCleanup(GetCurrentProcess()); // Clean up symbol handler if initialized
+    }
+#elif defined(Q_OS_UNIX)
+    signal(SIGSEGV, SIG_DFL); // Reset to default handler
+    signal(SIGABRT, SIG_DFL);
+    signal(SIGFPE, SIG_DFL);
+    signal(SIGILL, SIG_DFL);
 #endif
-    if (success) {
-        d->installed = false;
-        LOG_INFO("Crash handler uninstalled.");
-    } else {
-        LOG_WARN("Failed to uninstall crash handler.");
-    }
-    return success;
+
+    d->handlerInstalled = false;
+    LOG_INFO("Crash handler uninstalled.");
+    emit handlerUninstalled();
 }
 
-QDir CrashHandler::dumpDirectory() const
+bool CrashHandler::isInstalled() const
 {
     QMutexLocker locker(&d->mutex);
-    return d->dumpDir;
+    return d->handlerInstalled;
 }
 
-void CrashHandler::setDumpDirectory(const QDir& dir)
+QString CrashHandler::crashDumpPath() const
 {
     QMutexLocker locker(&d->mutex);
-    if (d->dumpDir != dir) {
-        d->dumpDir = dir;
-        d->ensureDumpDirExists(); // Attempt to create new directory
-        LOG_INFO("Crash dump directory changed to: " << dir.absolutePath());
-    }
+    return d->crashDumpPathStr;
 }
 
-bool CrashHandler::isEnabled() const
+void CrashHandler::setCrashDumpPath(const QString& path)
 {
     QMutexLocker locker(&d->mutex);
-    return d->enabled;
-}
-
-void CrashHandler::setEnabled(bool enabled)
-{
-    QMutexLocker locker(&d->mutex);
-    if (d->enabled != enabled) {
-        d->enabled = enabled;
-        if (enabled && !d->installed) {
-            install(); // Install if enabled and not already installed
-        } else if (!enabled && d->installed) {
-            uninstall(); // Uninstall if disabled and installed
-        }
-        LOG_INFO("Crash handler is now " << (enabled ? "enabled" : "disabled"));
+    if (d->crashDumpPathStr != path) {
+        d->crashDumpPathStr = path;
+        LOG_INFO("CrashHandler: Dump path set to: " << path);
+        // QDir().mkpath(path); // Ensure new path exists? Maybe do this just before writing a dump.
     }
 }
 
-void CrashHandler::simulateCrash()
-{
-    LOG_WARN("Simulating crash...");
-    // Voluntary crash - this will trigger the handler if installed
-    volatile int* p = nullptr;
-    *p = 42; // Dereference null pointer
-}
-
-QString CrashHandler::reporterExecutablePath() const
+bool CrashHandler::isMinidumpEnabled() const
 {
     QMutexLocker locker(&d->mutex);
-    return d->reporterPath;
+    return d->minidumpEnabled;
 }
 
-void CrashHandler::setReporterExecutablePath(const QString& path)
+void CrashHandler::setMinidumpEnabled(bool enabled)
 {
     QMutexLocker locker(&d->mutex);
-    d->reporterPath = path;
-    LOG_INFO("Crash reporter path set to: " << path);
-}
-
-int CrashHandler::pendingDumpCount() const
-{
-    QMutexLocker locker(&d->mutex);
-    if (!d->dumpDir.exists()) return 0;
-    QStringList filters = {"*.dmp", "*.dump"}; // Common dump file extensions
-    return d->dumpDir.entryList(filters, QDir::Files).size();
-}
-
-QStringList CrashHandler::pendingDumpPaths() const
-{
-    QMutexLocker locker(&d->mutex);
-    if (!d->dumpDir.exists()) return QStringList();
-    QStringList filters = {"*.dmp", "*.dump"};
-    QStringList files = d->dumpDir.entryList(filters, QDir::Files);
-    QStringList fullPaths;
-    fullPaths.reserve(files.size());
-    for (const QString& file : files) {
-        fullPaths.append(d->dumpDir.filePath(file));
+    if (d->minidumpEnabled != enabled) {
+        d->minidumpEnabled = enabled;
+        LOG_INFO("CrashHandler: Minidump generation set to: " << enabled);
     }
-    return fullPaths;
 }
 
-bool CrashHandler::submitDump(const QString& dumpFilePath)
-{
-    // This would typically launch the reporter executable with the dump file as an argument.
-    // For a stub, we'll just log.
-    Q_UNUSED(dumpFilePath);
-    LOG_WARN("submitDump: Stub implementation. Would launch reporter with: " << dumpFilePath);
-    // QProcess::startDetached(reporterExecutablePath(), {dumpFilePath});
-    emit dumpSubmitted(dumpFilePath);
-    return true; // Assume success for stub
-}
+// --- Static Handler Functions ---
 
-bool CrashHandler::submitAllPendingDumps()
-{
-    bool allSuccess = true;
-    QStringList dumps = pendingDumpPaths();
-    for (const QString& dumpPath : dumps) {
-        if (!submitDump(dumpPath)) {
-            allSuccess = false;
-            emit dumpSubmissionFailed(dumpPath, "Stub implementation failed");
-        }
-    }
-    return allSuccess;
-}
-
-bool CrashHandler::clearAllDumps()
-{
-    QMutexLocker locker(&d->mutex);
-    bool success = true;
-    QStringList dumps = pendingDumpPaths();
-    for (const QString& dumpPath : dumps) {
-        QFile dumpFile(dumpPath);
-        if (!dumpFile.remove()) {
-            LOG_ERROR("Failed to remove crash dump: " << dumpPath << ", Error: " << dumpFile.errorString());
-            success = false;
-        }
-    }
-    if (success && !dumps.isEmpty()) {
-        LOG_INFO("Cleared " << dumps.size() << " crash dump files.");
-        emit dumpsCleared();
-    }
-    return success;
-}
-
-CrashHandler::CrashInfo CrashHandler::lastCrashInfo() const
-{
-    QMutexLocker locker(&d->mutex);
-    return d->lastCrash;
-}
-
-// Platform-specific implementations
 #ifdef Q_OS_WIN
-LONG CrashHandler::Private::winExceptionHandler(EXCEPTION_POINTERS* ExceptionInfo) {
-    // Get QuantilyxDoc instance to emit signal
-    CrashHandler* instance = &CrashHandler::instance();
-    Private* d = instance->d.data();
+LONG CrashHandler::Private::windowsExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo)
+{
+    // This runs in a compromised context. Be extremely careful.
+    // Do not call C++ destructors, allocate memory, or call most Win32 APIs.
+    // Log to a pre-opened file handle or use DebugBreak/OutputDebugString potentially.
 
-    if (!d->enabled) return EXCEPTION_CONTINUE_SEARCH;
+    LOG_CRITICAL("Windows Unhandled Exception occurred! Code: 0x" << QString::number(ExceptionInfo->ExceptionRecord->ExceptionCode, 16));
 
-    // Generate dump file
-    QString dumpFileName = QString("quantilyxdoc_crash_%1.dmp").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
-    QString dumpPath = d->dumpDir.filePath(dumpFileName);
-
-    HANDLE hDumpFile = CreateFile(
-        (wchar_t*)dumpPath.utf16(),
-        GENERIC_WRITE,
-        0,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hDumpFile != INVALID_HANDLE_VALUE) {
-        MINIDUMP_EXCEPTION_INFORMATION ExpParam;
-        ExpParam.ThreadId = GetCurrentThreadId();
-        ExpParam.ExceptionPointers = ExceptionInfo;
-        ExpParam.ClientPointers = TRUE;
-
-        BOOL written = MiniDumpWriteDump(
-            GetCurrentProcess(),
-            GetCurrentProcessId(),
-            hDumpFile,
-            MiniDumpWithDataSegs, // Or a more comprehensive type
-            &ExpParam,
-            NULL,
-            NULL
-        );
-        CloseHandle(hDumpFile);
-
-        if (written) {
-            LOG_ERROR("Crash dump written to: " << dumpPath);
-
-            // Populate CrashInfo
-            CrashInfo info;
-            info.dumpFilePath = dumpPath;
-            info.crashReason = "Windows Exception";
-            info.signalOrException = QString::number(ExceptionInfo->ExceptionRecord->ExceptionCode, 16);
-            info.timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
-            info.applicationVersion = QCoreApplication::applicationVersion();
-            info.operatingSystem = d->getOSInfo();
-            // Stack trace would require more complex processing with dbghelp
-
-            d->lastCrash = info;
-            emit instance->crashDetected(info);
-
-            // Optionally launch reporter here, but it might be risky in a crashed state.
-            // It's safer to launch it on next app start if a dump is found.
-
-        } else {
-            LOG_ERROR("Failed to write minidump.");
-        }
-    } else {
-        LOG_ERROR("Failed to create dump file: " << dumpPath);
+    // Generate minidump if enabled
+    if (d->minidumpEnabled) {
+        generateMinidumpWin(ExceptionInfo); // Hypothetical function using DbgHelp
     }
 
-    // Return EXCEPTION_EXECUTE_HANDLER to terminate the process.
-    // Returning EXCEPTION_CONTINUE_SEARCH might allow other handlers to run.
+    // Attempt to notify the main thread/application
+    // This is tricky. Could try QueueUserAPC, PostThreadMessage, or a pipe.
+    // For now, we'll just try to print to stderr which might be captured.
+    fprintf(stderr, "QuantilyxDoc crashed (Windows Exception 0x%08x)\n", ExceptionInfo->ExceptionRecord->ExceptionCode);
+    fflush(stderr);
+
+    // Return EXCEPTION_EXECUTE_HANDLER to terminate the process,
+    // or EXCEPTION_CONTINUE_SEARCH to let other handlers try.
+    // Usually, we want to terminate after logging/generating dump.
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-bool CrashHandler::Private::setupWindowsHandler() {
-    SetUnhandledExceptionFilter(winExceptionHandler);
-    return true; // Assume success for this stub
+void CrashHandler::Private::generateMinidumpWin(PEXCEPTION_POINTERS ExceptionInfo)
+{
+    // This function uses Windows DbgHelp API to write a .dmp file.
+    // It requires significant setup and is quite complex.
+    // This is a stub outline.
+    LOG_WARN("CrashHandler::generateMinidumpWin: Requires DbgHelp API integration (SymInitialize, MiniDumpWriteDump). Not implemented in stub.");
+    Q_UNUSED(ExceptionInfo);
+    // HANDLE hDumpFile = CreateFile(...);
+    // MINIDUMP_EXCEPTION_INFORMATION dumpInfo;
+    // dumpInfo.ThreadId = GetCurrentThreadId();
+    // dumpInfo.ExceptionPointers = ExceptionInfo;
+    // dumpInfo.ClientPointers = FALSE;
+    // BOOL success = MiniDumpWriteDump(...);
+    // CloseHandle(hDumpFile);
 }
+#endif
 
-bool CrashHandler::Private::teardownWindowsHandler() {
-    SetUnhandledExceptionFilter(NULL);
-    return true;
-}
+#ifdef Q_OS_UNIX
+void CrashHandler::Private::posixSignalHandler(int sig)
+{
+    // This runs in a signal context. Be extremely careful.
+    // Async-signal-safe functions only (e.g., write, close, sigprocmask, but NOT malloc, printf, Qt functions, C++ constructors/destructors).
+    // Log to a pre-opened file or use low-level system calls.
 
-#elif defined(Q_OS_UNIX) && !defined(Q_OS_MAC)
-void CrashHandler::Private::unixSignalHandler(int sig) {
-    // Get QuantilyxDoc instance to emit signal
-    CrashHandler* instance = &CrashHandler::instance();
-    Private* d = instance->d.data();
-
-    if (!d->enabled) signal(sig, SIG_DFL); // Revert to default and re-raise
-
-    // Generate dump file - on Unix, this often means ensuring core dumps are allowed/configured
-    // and maybe writing a small metadata file here.
-    QString dumpFileName = QString("quantilyxdoc_crash_%1.dump").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
-    QString dumpPath = d->dumpDir.filePath(dumpFileName);
-
-    // For a full implementation, you'd use backtrace() and backtrace_symbols() to get a stack trace.
-    // Writing a core dump from within the signal handler is complex and often not recommended.
-    // A common approach is to write a small metadata file and rely on system core dumps or
-    // external tools (like Breakpad/Google Crashpad) which are better suited for this.
-
-    // Stub: write a simple metadata file
-    QFile metaFile(dumpPath + ".meta");
-    if (metaFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QTextStream stream(&metaFile);
-        stream << "Signal: " << sig << "\n";
-        stream << "Timestamp: " << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << "\n";
-        stream << "PID: " << QCoreApplication::applicationPid() << "\n";
-        stream << "App Version: " << QCoreApplication::applicationVersion() << "\n";
-        stream << "OS: " << d->getOSInfo() << "\n";
-        metaFile.close();
-        LOG_ERROR("Crash metadata written to: " << dumpPath << ".meta");
+    const char* sigName = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: sigName = "SIGSEGV"; break;
+        case SIGABRT: sigName = "SIGABRT"; break;
+        case SIGFPE:  sigName = "SIGFPE";  break;
+        case SIGILL:  sigName = "SIGILL";  break;
+        default: break;
     }
 
-    // Populate CrashInfo
-    CrashInfo info;
-    info.dumpFilePath = dumpPath + ".meta"; // Point to our metadata file for now
-    info.crashReason = QString("Signal %1").arg(sig);
-    info.signalOrException = QString::number(sig);
-    info.timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
-    info.applicationVersion = QCoreApplication::applicationVersion();
-    info.operatingSystem = d->getOSInfo();
+    char msg[256];
+    int len = snprintf(msg, sizeof(msg), "QuantilyxDoc received fatal signal: %s (%d)\n", sigName, sig);
+    if (len > 0 && len < (int)sizeof(msg)) {
+        write(STDERR_FILENO, msg, len); // Write directly to stderr
+    }
 
-    d->lastCrash = info;
-    emit instance->crashDetected(info);
+    // Attempt to generate a core dump or log state if possible.
+    // Generating a minidump equivalent on Unix is often done by external tools or libraries (e.g., Google Breakpad).
+    // A simple approach might be to log stack trace using backtrace() if available and linked correctly.
+    // For now, we just log the signal and terminate.
+    // The OS might generate a core dump based on system settings (ulimit -c).
 
-    // Revert to default handler and re-raise signal to terminate process properly
+    // Raise the signal again with default handler to actually terminate
     signal(sig, SIG_DFL);
     raise(sig);
 }
+#endif
 
-bool CrashHandler::Private::setupUnixHandler() {
-    // Install handlers for common crash signals
-    signal(SIGSEGV, unixSignalHandler);
-    signal(SIGABRT, unixSignalHandler);
-    signal(SIGBUS, unixSignalHandler);
-    signal(SIGILL, unixSignalHandler);
-    signal(SIGFPE, unixSignalHandler);
-    // SIGPIPE is often ignored by default, might not cause crash but terminate
-    // signal(SIGPIPE, unixSignalHandler); // Usually not a crash, but can terminate
-    return true;
-}
+// --- Private Helper Implementation ---
+class CrashHandler::Private {
+public:
+    Private(CrashHandler* q_ptr)
+        : q(q_ptr), handlerInstalled(false), minidumpEnabled(false) {}
 
-bool CrashHandler::Private::teardownUnixHandler() {
-    // Revert to default handlers
-    signal(SIGSEGV, SIG_DFL);
-    signal(SIGABRT, SIG_DFL);
-    signal(SIGBUS, SIG_DFL);
-    signal(SIGILL, SIG_DFL);
-    signal(SIGFPE, SIG_DFL);
-    return true;
-}
-#endif // Q_OS_UNIX
+    CrashHandler* q;
+    mutable QMutex mutex; // Protect access to state variables
+    bool handlerInstalled;
+    bool minidumpEnabled;
+    QString crashDumpPathStr;
+
+#ifdef Q_OS_WIN
+    static LONG WINAPI windowsExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo);
+    static void generateMinidumpWin(PEXCEPTION_POINTERS ExceptionInfo);
+#endif
+
+#ifdef Q_OS_UNIX
+    static void posixSignalHandler(int sig);
+#endif
+};
 
 } // namespace QuantilyxDoc

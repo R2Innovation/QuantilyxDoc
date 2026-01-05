@@ -9,154 +9,21 @@
  */
 #include "ProfileManager.h"
 #include "Logger.h"
-#include "Settings.h" // Use our central Settings manager
+#include "Settings.h"
 #include "utils/FileUtils.h" // Assuming this exists
-#include <QStandardPaths>
 #include <QDir>
-#include <QFileInfo>
+#include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QFile>
+#include <QTextStream>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QCoreApplication>
-#include <QDateTime>
 #include <QDebug>
 
 namespace QuantilyxDoc {
-
-class ProfileManager::Private {
-public:
-    Private(ProfileManager* q_ptr)
-        : q(q_ptr), profilesDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/profiles"),
-          defaultProfileId("default") {}
-
-    ProfileManager* q;
-    mutable QMutex mutex; // Protect access to profiles map and current profile
-    QHash<QString, Profile> profiles;
-    QString currentProfileId;
-    QDir profilesDir;
-    QString defaultProfileId;
-
-    // Helper to ensure profiles directory exists
-    bool ensureProfilesDirExists() {
-        if (!profilesDir.exists()) {
-            return profilesDir.mkpath(".");
-        }
-        return true;
-    }
-
-    // Helper to get the directory for a specific profile
-    QDir profileDir(const QString& profileId) const {
-        return QDir(profilesDir.absoluteFilePath(profileId));
-    }
-
-    // Helper to load profile metadata from disk
-    Profile loadProfileFromDisk(const QString& profileId) {
-        Profile profile;
-        QDir profileDir = this->profileDir(profileId);
-        if (!profileDir.exists()) {
-            LOG_WARN("Profile directory does not exist: " << profileDir.absolutePath());
-            return profile; // Return invalid profile
-        }
-
-        profile.id = profileId;
-        profile.settingsDirectory = profileDir;
-
-        // Load metadata.json
-        QFile metaFile(profileDir.filePath("metadata.json"));
-        if (metaFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QJsonParseError error;
-            QJsonDocument doc = QJsonDocument::fromJson(metaFile.readAll(), &error);
-            if (error.error == QJsonParseError::NoError && doc.isObject()) {
-                profile.metadata = doc.object();
-                profile.name = profile.metadata.value("name").toString();
-                profile.description = profile.metadata.value("description").toString();
-                profile.isDefault = profile.metadata.value("isDefault").toBool(false);
-                profile.isReadOnly = profile.metadata.value("isReadOnly").toBool(false);
-                // Load creation/lastUsed times if present
-                QString creationStr = profile.metadata.value("creationTime").toString();
-                QString lastUsedStr = profile.metadata.value("lastUsedTime").toString();
-                if (!creationStr.isEmpty()) profile.creationTime = QDateTime::fromString(creationStr, Qt::ISODateWithMs);
-                if (!lastUsedStr.isEmpty()) profile.lastUsedTime = QDateTime::fromString(lastUsedStr, Qt::ISODateWithMs);
-            } else {
-                LOG_WARN("Failed to parse metadata for profile " << profileId << ": " << error.errorString());
-                // Fall back to default values derived from directory name or generic ones.
-                profile.name = profileId;
-            }
-            metaFile.close();
-        } else {
-            // If no metadata file, create a minimal one based on directory name
-            LOG_DEBUG("No metadata file found for profile " << profileId << ", creating default.");
-            profile.name = profileId;
-            profile.creationTime = QDateTime::currentDateTime();
-            saveProfileMetadataToDisk(profile);
-        }
-        return profile;
-    }
-
-    // Helper to save profile metadata to disk
-    bool saveProfileMetadataToDisk(const Profile& profile) {
-        QDir profileDir = this->profileDir(profile.id);
-        if (!profileDir.exists() && !profileDir.mkpath(".")) {
-            LOG_ERROR("Failed to create profile directory: " << profileDir.absolutePath());
-            return false;
-        }
-
-        QFile metaFile(profileDir.filePath("metadata.json"));
-        if (!metaFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            LOG_ERROR("Failed to open metadata file for writing: " << metaFile.fileName());
-            return false;
-        }
-
-        QJsonObject metaObj;
-        metaObj["id"] = profile.id;
-        metaObj["name"] = profile.name;
-        metaObj["description"] = profile.description;
-        metaObj["isDefault"] = profile.isDefault;
-        metaObj["isReadOnly"] = profile.isReadOnly;
-        if (profile.creationTime.isValid()) metaObj["creationTime"] = profile.creationTime.toString(Qt::ISODateWithMs);
-        if (profile.lastUsedTime.isValid()) metaObj["lastUsedTime"] = profile.lastUsedTime.toString(Qt::ISODateWithMs);
-        // Add other metadata fields as needed
-
-        QJsonDocument doc(metaObj);
-        qint64 written = metaFile.write(doc.toJson());
-        bool success = (written == doc.toJson().size());
-        metaFile.close();
-
-        if (success) {
-            LOG_DEBUG("Saved metadata for profile: " << profile.id);
-        } else {
-            LOG_ERROR("Failed to write metadata for profile: " << profile.id);
-        }
-        return success;
-    }
-
-    // Helper to set the current profile, loading its settings
-    bool setCurrentProfileInternal(const QString& profileId) {
-        if (!profiles.contains(profileId)) {
-            LOG_ERROR("Cannot set current profile to non-existent ID: " << profileId);
-            return false;
-        }
-
-        QString oldProfileId = currentProfileId;
-        currentProfileId = profileId;
-        Profile& profile = profiles[profileId];
-        profile.lastUsedTime = QDateTime::currentDateTime();
-        saveProfileMetadataToDisk(profile); // Update last used time
-
-        // Load settings from the new profile's directory
-        Settings& settings = Settings::instance();
-        QDir settingsDir = profile.settingsDirectory;
-        QString settingsPath = settingsDir.filePath("settings.conf");
-        // This assumes Settings class can load from a specific path.
-        // settings.loadFromPath(settingsPath); // Hypothetical method
-        // For now, we'll just log the switch.
-        LOG_INFO("Switched profile from '" << oldProfileId << "' to '" << profileId << "'");
-        emit q->profileChanged(oldProfileId, profileId);
-        return true;
-    }
-};
 
 // Static instance pointer
 ProfileManager* ProfileManager::s_instance = nullptr;
@@ -173,339 +40,519 @@ ProfileManager::ProfileManager(QObject* parent)
     : QObject(parent)
     , d(new Private(this))
 {
-    // Initialization happens in initialize()
+    LOG_INFO("ProfileManager created.");
 }
 
 ProfileManager::~ProfileManager()
 {
-    // Save current profile state if necessary
-    saveCurrentProfile();
+    // Ensure current profile is saved before destruction?
+    // saveCurrentProfile();
+    LOG_INFO("ProfileManager destroyed.");
 }
 
 bool ProfileManager::initialize()
 {
     QMutexLocker locker(&d->mutex);
 
-    if (!d->ensureProfilesDirExists()) {
-        LOG_ERROR("Failed to create profiles directory: " << d->profilesDir.absolutePath());
+    if (d->initialized) {
+        LOG_WARN("ProfileManager::initialize: Already initialized.");
+        return true;
+    }
+
+    d->profilesDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/profiles";
+    QDir().mkpath(d->profilesDirectory); // Ensure profiles directory exists
+
+    if (!loadProfileList()) {
+        LOG_ERROR("ProfileManager: Failed to load profile list from " << d->profilesDirectory);
         return false;
     }
 
-    // Scan profiles directory for subdirectories (potential profiles)
-    QStringList profileDirs = d->profilesDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    LOG_DEBUG("Found potential profiles: " << profileDirs.join(", "));
-
-    for (const QString& dirName : profileDirs) {
-        Profile profile = d->loadProfileFromDisk(dirName);
-        if (!profile.id.isEmpty()) { // Check if loading was successful
-            d->profiles.insert(profile.id, profile);
-            LOG_DEBUG("Loaded profile: " << profile.name << " (ID: " << profile.id << ")");
+    // Determine the initial active profile
+    QString desiredProfileName = Settings::instance().value<QString>("General/ActiveProfile", "default");
+    if (d->profiles.contains(desiredProfileName)) {
+        if (!switchToProfile(desiredProfileName)) {
+            LOG_WARN("ProfileManager: Could not switch to startup profile '" << desiredProfileName << "', falling back to 'default'.");
+            if (!switchToProfile("default") && !d->profiles.isEmpty()) {
+                // If 'default' doesn't exist or fails, try the first available profile
+                QString firstProfileName = d->profiles.keys().first();
+                if (!switchToProfile(firstProfileName)) {
+                    LOG_CRITICAL("ProfileManager: Failed to switch to any available profile after 'default' failed.");
+                    return false;
+                }
+            } else if (d->profiles.isEmpty()) {
+                 // No profiles exist, create a default one
+                 if (!createProfile("default", "Default profile created at first run.")) {
+                      LOG_CRITICAL("ProfileManager: Failed to create initial default profile.");
+                      return false;
+                 }
+                 if (!switchToProfile("default")) {
+                      LOG_CRITICAL("ProfileManager: Failed to switch to the newly created default profile.");
+                      return false;
+                 }
+            }
+        }
+    } else {
+        LOG_WARN("ProfileManager: Startup profile '" << desiredProfileName << "' not found, falling back to 'default' or creating it.");
+        if (!d->profiles.contains("default")) {
+            if (!createProfile("default", "Default profile")) {
+                LOG_CRITICAL("ProfileManager: Failed to create default profile.");
+                return false;
+            }
+        }
+        if (!switchToProfile("default")) {
+            LOG_CRITICAL("ProfileManager: Failed to switch to default profile.");
+            return false;
         }
     }
 
-    // Ensure default profile exists
-    if (!d->profiles.contains(d->defaultProfileId)) {
-        LOG_INFO("Default profile '" << d->defaultProfileId << "' does not exist, creating it.");
-        createProfile("Default Profile", "The default application profile.");
-    }
-
-    // Set the current profile to the default (or the first one if default is missing)
-    QString initialProfileId = d->defaultProfileId;
-    if (!d->profiles.contains(initialProfileId) && !d->profiles.isEmpty()) {
-        initialProfileId = d->profiles.begin().key(); // Fallback to first profile
-    }
-
-    if (!initialProfileId.isEmpty()) {
-        d->setCurrentProfileInternal(initialProfileId);
-    } else {
-        LOG_ERROR("No profiles found and could not create default. ProfileManager failed to initialize correctly.");
-        return false;
-    }
-
-    emit profilesListChanged();
-    LOG_INFO("ProfileManager initialized with " << d->profiles.size() << " profiles. Current: " << d->currentProfileId);
+    d->initialized = true;
+    LOG_INFO("ProfileManager initialized. Active profile: " << d->currentProfileName);
+    emit initializationComplete(true);
     return true;
 }
 
-const ProfileManager::Profile* ProfileManager::currentProfile() const
+bool ProfileManager::isInitialized() const
 {
     QMutexLocker locker(&d->mutex);
-    auto it = d->profiles.constFind(d->currentProfileId);
-    if (it != d->profiles.constEnd()) {
-        return &it.value();
-    }
-    return nullptr; // Should not happen if initialized correctly
+    return d->initialized;
 }
 
-bool ProfileManager::switchToProfile(const QString& profileId)
-{
-    if (profileId == d->currentProfileId) return true; // Already active
-
-    QMutexLocker locker(&d->mutex);
-    if (!d->profiles.contains(profileId)) {
-        LOG_WARN("Cannot switch to non-existent profile: " << profileId);
-        return false;
-    }
-
-    // Save current profile's state before switching
-    saveCurrentProfile();
-
-    return d->setCurrentProfileInternal(profileId);
-}
-
-QString ProfileManager::createProfile(const QString& name, const QString& description)
+bool ProfileManager::switchToProfile(const QString& profileName)
 {
     QMutexLocker locker(&d->mutex);
 
-    // Generate a unique ID based on the name
-    QString baseId = name.toLower().remove(QRegExp("[^a-z0-9_]")); // Sanitize name
-    if (baseId.isEmpty()) baseId = "new_profile";
-    QString profileId = baseId;
-    int counter = 1;
-    while (d->profiles.contains(profileId)) {
-        profileId = baseId + "_" + QString::number(counter);
-        counter++;
-    }
-
-    Profile newProfile;
-    newProfile.id = profileId;
-    newProfile.name = name;
-    newProfile.description = description;
-    newProfile.creationTime = QDateTime::currentDateTime();
-    newProfile.lastUsedTime = newProfile.creationTime; // First used now
-    newProfile.settingsDirectory = d->profileDir(profileId);
-    newProfile.isDefault = false; // New profiles are not default
-    newProfile.isReadOnly = false; // New profiles are editable
-
-    if (d->saveProfileMetadataToDisk(newProfile)) {
-        d->profiles.insert(profileId, newProfile);
-        LOG_INFO("Created new profile: " << name << " (ID: " << profileId << ")");
-        emit profileCreated(profileId);
-        emit profilesListChanged();
-        return profileId;
-    } else {
-        LOG_ERROR("Failed to save new profile: " << name);
-        return QString(); // Return empty string on failure
-    }
-}
-
-bool ProfileManager::removeProfile(const QString& profileId)
-{
-    if (profileId == d->defaultProfileId) {
-        LOG_WARN("Cannot remove the default profile: " << profileId);
+    if (!d->initialized) {
+        LOG_ERROR("ProfileManager::switchToProfile: Not initialized.");
         return false;
     }
 
-    QMutexLocker locker(&d->mutex);
-    auto it = d->profiles.find(profileId);
-    if (it == d->profiles.end()) {
-        LOG_WARN("Cannot remove non-existent profile: " << profileId);
+    if (profileName == d->currentProfileName) {
+        LOG_DEBUG("ProfileManager::switchToProfile: Already on profile '" << profileName << "'.");
+        return true;
+    }
+
+    if (!d->profiles.contains(profileName)) {
+        LOG_ERROR("ProfileManager::switchToProfile: Profile '" << profileName << "' does not exist.");
         return false;
     }
 
-    // Delete the profile's directory
-    QDir profileDir = d->profileDir(profileId);
-    if (profileDir.exists() && !QDir().rmdir(profileDir.absolutePath())) { // Use QDir() to remove recursively if needed, or QFile::removeRecursively
-        // QFile::removeRecursively(profileDir.absolutePath()); // Alternative for recursive delete
-        LOG_ERROR("Failed to delete profile directory: " << profileDir.absolutePath());
+    // Save current profile's settings before switching
+    if (!saveCurrentProfile()) {
+        LOG_WARN("ProfileManager::switchToProfile: Failed to save settings for current profile '" << d->currentProfileName << "'. Continuing with switch.");
+        // We might want to abort the switch here, depending on requirements.
+        // For now, continue.
+    }
+
+    // Load the new profile's settings
+    QString profilePath = profilePathForName(profileName);
+    if (!loadSettingsFromPath(profilePath)) {
+        LOG_ERROR("ProfileManager::switchToProfile: Failed to load settings for profile '" << profileName << "'.");
         return false;
     }
 
-    d->profiles.erase(it);
-    LOG_INFO("Removed profile: " << profileId);
-    emit profileRemoved(profileId);
-    emit profilesListChanged();
-
-    // If the removed profile was current, switch to default
-    if (profileId == d->currentProfileId) {
-        switchToProfile(d->defaultProfileId);
-    }
-
+    d->currentProfileName = profileName;
+    LOG_INFO("ProfileManager: Switched to profile '" << profileName << "'. Settings loaded.");
+    emit profileSwitched(profileName);
     return true;
 }
 
-bool ProfileManager::renameProfile(const QString& profileId, const QString& newName)
+QString ProfileManager::currentProfileName() const
 {
-    if (profileId == d->defaultProfileId) {
-        LOG_WARN("Cannot rename the default profile: " << profileId);
+    QMutexLocker locker(&d->mutex);
+    return d->currentProfileName;
+}
+
+QStringList ProfileManager::profileNames() const
+{
+    QMutexLocker locker(&d->mutex);
+    return d->profiles.keys(); // Returns a copy of the keys (profile names)
+}
+
+bool ProfileManager::createProfile(const QString& profileName, const QString& description)
+{
+    if (profileName.isEmpty()) {
+        LOG_ERROR("ProfileManager::createProfile: Profile name cannot be empty.");
         return false;
     }
 
     QMutexLocker locker(&d->mutex);
-    auto it = d->profiles.find(profileId);
-    if (it == d->profiles.end()) {
-        LOG_WARN("Cannot rename non-existent profile: " << profileId);
+
+    if (d->profiles.contains(profileName)) {
+        LOG_ERROR("ProfileManager::createProfile: Profile '" << profileName << "' already exists.");
         return false;
     }
 
-    QString oldName = it->name;
-    it->name = newName;
-    it->metadata["name"] = newName; // Update metadata object too
+    QString profilePath = profilePathForName(profileName);
+    if (!QDir().mkpath(profilePath)) {
+        LOG_ERROR("ProfileManager::createProfile: Failed to create profile directory: " << profilePath);
+        return false;
+    }
 
-    if (d->saveProfileMetadataToDisk(*it)) {
-        LOG_INFO("Renamed profile from '" << oldName << "' to '" << newName << "' (ID: " << profileId << ")");
-        emit profileRenamed(profileId, oldName, newName);
+    // Create an initial, minimal settings file for the new profile.
+    // This could be a copy of the current profile's settings, default settings, or empty.
+    // Let's start with an empty settings file that will be populated by Settings::save() when something changes.
+    QString settingsPath = profilePath + "/settings.json"; // Or settings.ini, depending on Settings implementation
+    QFile settingsFile(settingsPath);
+    if (settingsFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QJsonDocument emptyDoc(QJsonObject()); // Start with an empty object
+        settingsFile.write(emptyDoc.toJson());
+        settingsFile.close();
+        LOG_INFO("ProfileManager: Created new profile '" << profileName << "' at: " << profilePath);
+    } else {
+        LOG_ERROR("ProfileManager::createProfile: Failed to create initial settings file for profile '" << profileName << "': " << settingsFile.errorString());
+        QDir().rmdir(profilePath); // Clean up the created directory if settings file creation failed
+        return false;
+    }
+
+    // Add profile to internal list
+    ProfileInfo info;
+    info.name = profileName;
+    info.description = description;
+    info.path = profilePath;
+    info.creationDate = QDateTime::currentDateTime();
+    info.modificationDate = info.creationDate;
+    d->profiles.insert(profileName, info);
+
+    // Update the profiles list file
+    if (!saveProfileList()) {
+        LOG_WARN("ProfileManager::createProfile: Created profile '" << profileName << "' but failed to update profiles list file.");
+        // The profile exists on disk and in memory, but the list file is out of sync.
+        // We could remove the profile directory here, but that might be harsh.
+        // Let's log and continue, assuming the user can fix the list file or re-initialize.
+    }
+
+    emit profileCreated(profileName);
+    return true;
+}
+
+bool ProfileManager::deleteProfile(const QString& profileName)
+{
+    if (profileName == "default") {
+        LOG_ERROR("ProfileManager::deleteProfile: Cannot delete the 'default' profile.");
+        return false;
+    }
+
+    QMutexLocker locker(&d->mutex);
+
+    if (!d->profiles.contains(profileName)) {
+        LOG_WARN("ProfileManager::deleteProfile: Profile '" << profileName << "' does not exist.");
+        return false;
+    }
+
+    if (profileName == d->currentProfileName) {
+        LOG_ERROR("ProfileManager::deleteProfile: Cannot delete the currently active profile '" << profileName << "'. Switch profiles first.");
+        return false;
+    }
+
+    QString profilePath = d->profiles.value(profileName).path;
+    bool success = QDir(profilePath).removeRecursively(); // Delete the entire profile directory
+
+    if (success) {
+        d->profiles.remove(profileName);
+        LOG_INFO("ProfileManager: Deleted profile '" << profileName << "' from: " << profilePath);
+        if (!saveProfileList()) {
+            LOG_WARN("ProfileManager::deleteProfile: Deleted profile '" << profileName << "' but failed to update profiles list file.");
+        }
+        emit profileDeleted(profileName);
+    } else {
+        LOG_ERROR("ProfileManager::deleteProfile: Failed to delete profile directory '" << profilePath << "'. Check permissions.");
+    }
+    return success;
+}
+
+bool ProfileManager::renameProfile(const QString& oldName, const QString& newName)
+{
+    if (oldName.isEmpty() || newName.isEmpty()) {
+        LOG_ERROR("ProfileManager::renameProfile: Old or new name is empty.");
+        return false;
+    }
+    if (oldName == newName) {
+        LOG_WARN("ProfileManager::renameProfile: Old and new names are the same.");
+        return true; // Not an error, just nothing to do
+    }
+    if (newName == "default") {
+        LOG_ERROR("ProfileManager::renameProfile: Cannot rename a profile to 'default'.");
+        return false; // Or handle 'default' specially if needed
+    }
+
+    QMutexLocker locker(&d->mutex);
+
+    if (!d->profiles.contains(oldName)) {
+        LOG_ERROR("ProfileManager::renameProfile: Profile '" << oldName << "' does not exist.");
+        return false;
+    }
+
+    if (d->profiles.contains(newName)) {
+        LOG_ERROR("ProfileManager::renameProfile: Profile '" << newName << "' already exists.");
+        return false;
+    }
+
+    ProfileInfo info = d->profiles.take(oldName); // Remove from map
+    info.name = newName; // Update name in info struct
+    QString oldPath = info.path;
+    QString newPath = profilePathForName(newName); // Generate new path based on new name
+    info.path = newPath;
+
+    // Rename the directory
+    bool success = QDir().rename(oldPath, newPath);
+    if (success) {
+        d->profiles.insert(newName, info); // Re-insert with new key
+        LOG_INFO("ProfileManager: Renamed profile from '" << oldName << "' to '" << newName << "'. Path: " << newPath);
+        if (!saveProfileList()) {
+            LOG_WARN("ProfileManager::renameProfile: Renamed profile '" << newName << "' but failed to update profiles list file.");
+        }
+        emit profileRenamed(oldName, newName);
+    } else {
+        LOG_ERROR("ProfileManager::renameProfile: Failed to rename profile directory from '" << oldPath << "' to '" << newPath << "'. Check permissions.");
+        // Put the profile info back in the map under the old name as the rename failed
+        d->profiles.insert(oldName, info);
+    }
+    return success;
+}
+
+bool ProfileManager::saveCurrentProfile()
+{
+    QMutexLocker locker(&d->mutex);
+
+    if (d->currentProfileName.isEmpty()) {
+        LOG_WARN("ProfileManager::saveCurrentProfile: No active profile to save.");
+        return false;
+    }
+
+    QString profilePath = profilePathForName(d->currentProfileName);
+    QString settingsPath = profilePath + "/settings.json"; // Or the format used by Settings
+
+    // Get current settings from the global Settings instance and save them to the profile-specific path
+    if (Settings::instance().saveToPath(settingsPath)) { // Assuming Settings has a saveToPath method
+        LOG_DEBUG("ProfileManager: Saved settings for current profile '" << d->currentProfileName << "' to: " << settingsPath);
+        // Update modification date in the profile list info
+        if (d->profiles.contains(d->currentProfileName)) {
+            d->profiles[d->currentProfileName].modificationDate = QDateTime::currentDateTime();
+        }
         return true;
     } else {
-        LOG_ERROR("Failed to save renamed profile meta " << profileId);
+        LOG_ERROR("ProfileManager::saveCurrentProfile: Failed to save settings for profile '" << d->currentProfileName << "'.");
         return false;
     }
 }
 
-QStringList ProfileManager::profileIds() const
+bool ProfileManager::exportProfile(const QString& profileName, const QString& exportPath)
 {
-    QMutexLocker locker(&d->mutex);
-    return d->profiles.keys();
-}
-
-ProfileManager::Profile ProfileManager::profile(const QString& profileId) const
-{
-    QMutexLocker locker(&d->mutex);
-    auto it = d->profiles.constFind(profileId);
-    if (it != d->profiles.constEnd()) {
-        return it.value();
+    if (profileName.isEmpty() || exportPath.isEmpty()) {
+        LOG_ERROR("ProfileManager::exportProfile: Profile name or export path is empty.");
+        return false;
     }
-    return Profile(); // Return invalid profile
-}
 
-QDir ProfileManager::profilesDirectory() const
-{
     QMutexLocker locker(&d->mutex);
-    return d->profilesDir;
-}
 
-void ProfileManager::setProfilesDirectory(const QDir& dir)
-{
-    QMutexLocker locker(&d->mutex);
-    if (d->profilesDir != dir) {
-        // Changing the directory after initialization is complex.
-        // It would require re-loading all profiles.
-        // For now, log a warning if attempted after initialization.
-        if (!d->profiles.isEmpty()) {
-            LOG_WARN("Changing profiles directory after initialization is not fully supported. Current profiles may become invalid.");
-        }
-        d->profilesDir = dir;
-        LOG_INFO("Profiles directory set to: " << dir.absolutePath());
+    if (!d->profiles.contains(profileName)) {
+        LOG_ERROR("ProfileManager::exportProfile: Profile '" << profileName << "' does not exist.");
+        return false;
     }
+
+    QString profilePath = d->profiles.value(profileName).path;
+
+    // Use a utility function or QProcess to create an archive (e.g., zip) of the profile directory
+    // This is complex and might require an external tool or a library like libzip.
+    // For now, let's assume a hypothetical utility function exists.
+    // bool success = FileUtils::createZipArchive(profilePath, exportPath);
+    Q_UNUSED(profilePath);
+    Q_UNUSED(exportPath);
+    LOG_WARN("ProfileManager::exportProfile: Not implemented. Requires archiving library or external tool.");
+    return false; // Placeholder
 }
 
-QString ProfileManager::defaultProfileId() const
+bool ProfileManager::importProfile(const QString& importPath, const QString& newName)
 {
-    QMutexLocker locker(&d->mutex);
-    return d->defaultProfileId;
-}
-
-void ProfileManager::setDefaultProfileId(const QString& id)
-{
-    QMutexLocker locker(&d->mutex);
-    if (d->defaultProfileId != id) {
-        // Validate that the new default exists?
-        if (d->profiles.contains(id)) {
-            d->defaultProfileId = id;
-            LOG_INFO("Default profile ID changed to: " << id);
-            // Update metadata for the new and old default profiles if they exist
-            auto oldDefaultIt = d->profiles.find(d->defaultProfileId); // This is now the new ID
-            if (oldDefaultIt != d->profiles.end()) {
-                 oldDefaultIt->isDefault = true;
-                 // The previously default profile needs its flag cleared, but we don't know its old ID here directly.
-                 // A full scan or keeping track would be needed. For now, assume user manages this via rename/remove.
-            }
-            // A more robust way is to reload all profiles and update the 'isDefault' flag based on d->defaultProfileId.
-            // Reload logic is complex, so we'll just save the current state of the new default.
-            // The next time profiles are loaded/initialized, the correct one will be marked.
-        } else {
-            LOG_WARN("Attempted to set non-existent profile as default: " << id);
-        }
+    if (importPath.isEmpty() || newName.isEmpty()) {
+        LOG_ERROR("ProfileManager::importProfile: Import path or new name is empty.");
+        return false;
     }
-}
 
-QString ProfileManager::importProfile(const QString& importPath, const QString& newName)
-{
-    // This is a stub. A full implementation would involve:
-    // 1. Validating importPath (file or directory)
-    // 2. Extracting the profile archive if it's a file (e.g., .zip)
-    // 3. Copying the profile directory structure to the profiles location
-    // 4. Renaming the profile directory and updating its metadata.json
-    // 5. Loading the new profile into the manager.
+    // Use a utility function or QProcess to extract an archive (e.g., zip) to the profiles directory
+    // Check if the extracted directory contains valid settings/config files.
+    // Add the new profile to the internal list and update the list file.
+    // For now, let's assume a hypothetical utility function exists.
+    // QString extractedPath = profilesDirectory() + "/" + newName;
+    // bool extractSuccess = FileUtils::extractZipArchive(importPath, extractedPath);
+    // if (!extractSuccess) { ... return false; ... }
+    // bool validateSuccess = validateProfileDirectory(extractedPath); // Hypothetical validator
+    // if (!validateSuccess) { ... QDir(extractedPath).removeRecursively(); ... return false; ... }
+    // Add profile to internal list and save list file.
     Q_UNUSED(importPath);
     Q_UNUSED(newName);
-    LOG_WARN("importProfile: Stub implementation.");
-    // Example: QFile::copyRecursively(importPath, d->profileDir(newId).absolutePath());
-    return QString(); // Return empty for stub
+    LOG_WARN("ProfileManager::importProfile: Not implemented. Requires archiving library or external tool.");
+    return false; // Placeholder
 }
 
-bool ProfileManager::exportProfile(const QString& profileId, const QString& exportPath)
+// --- Helpers ---
+bool ProfileManager::loadProfileList()
 {
-    // This is a stub. A full implementation would involve:
-    // 1. Validating the profileId exists.
-    // 2. Creating an archive (e.g., .zip) at exportPath.
-    // 3. Adding the profile's directory contents to the archive.
-    Q_UNUSED(profileId);
-    Q_UNUSED(exportPath);
-    LOG_WARN("exportProfile: Stub implementation.");
-    return false; // Return false for stub
-}
+    QString listPath = d->profilesDirectory + "/profiles.json"; // Or profiles.list, profiles.ini, etc.
+    QFile listFile(listPath);
 
-void ProfileManager::saveCurrentProfile()
-{
-    // This function should save the current application state (settings, window layout, etc.)
-    // into the directory of the *current* profile.
-    // It involves calling save methods on Settings, MainWindow (for layout), etc.
-    // and writing them to files within the current profile's settingsDirectory.
-    QMutexLocker locker(&d->mutex);
-    if (d->currentProfileId.isEmpty()) {
-        LOG_WARN("saveCurrentProfile: No current profile set.");
-        return;
+    if (!listFile.exists()) {
+        LOG_INFO("ProfileManager: Profiles list file does not exist. Assuming first run, creating default profile.");
+        // If the list file doesn't exist, it might be the first run. Create a default profile.
+        // This logic might be better handled by the initialize() method calling createProfile if d->profiles is empty after attempting load.
+        // Let's just return true here, meaning no profiles were loaded from the list file (which is fine if it didn't exist).
+        // initialize() will handle creating default if needed.
+        return true;
     }
 
-    auto it = d->profiles.find(d->currentProfileId);
-    if (it != d->profiles.end()) {
-        QDir settingsDir = it->settingsDirectory;
-        QString settingsPath = settingsDir.filePath("settings.conf");
-        // Settings::instance().saveToPath(settingsPath); // Hypothetical method
-        LOG_DEBUG("Saved current profile state to: " << settingsDir.absolutePath());
+    if (!listFile.open(QIODevice::ReadOnly)) {
+        LOG_ERROR("ProfileManager: Failed to open profiles list file for reading: " << listPath << ", Error: " << listFile.errorString());
+        return false;
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(listFile.readAll(), &parseError);
+    listFile.close();
+
+    if (parseError.error != QJsonParseError::NoError) {
+        LOG_ERROR("ProfileManager: Failed to parse profiles list JSON: " << parseError.errorString());
+        return false;
+    }
+
+    if (!doc.isObject()) {
+        LOG_ERROR("ProfileManager: Profiles list file does not contain a JSON object.");
+        return false;
+    }
+
+    QJsonObject rootObj = doc.object();
+    QJsonValue profilesValue = rootObj.value("profiles");
+    if (!profilesValue.isArray()) {
+        LOG_ERROR("ProfileManager: Profiles list JSON root object does not have a 'profiles' array.");
+        return false;
+    }
+
+    QJsonArray profilesArray = profilesValue.toArray();
+    d->profiles.clear(); // Clear existing list in memory
+
+    for (const auto& profileValue : profilesArray) {
+        if (profileValue.isObject()) {
+            QJsonObject profileObj = profileValue.toObject();
+            QString name = profileObj.value("name").toString();
+            QString description = profileObj.value("description").toString();
+            QString path = profileObj.value("path").toString(); // Should be relative or validated absolute
+            QString creationStr = profileObj.value("creationDate").toString(); // ISO date string
+            QString modificationStr = profileObj.value("modificationDate").toString(); // ISO date string
+
+            if (name.isEmpty() || path.isEmpty()) {
+                LOG_WARN("ProfileManager::loadProfileList: Invalid profile entry found in list file (missing name or path), skipping.");
+                continue;
+            }
+
+            // Validate that the path points to an existing directory within the expected profiles location
+            QFileInfo pathInfo(path);
+            if (!pathInfo.exists() || !pathInfo.isDir() || !path.startsWith(d->profilesDirectory)) {
+                 LOG_WARN("ProfileManager::loadProfileList: Profile '" << name << "' has invalid path: " << path << ". Skipping.");
+                 continue;
+            }
+
+            ProfileInfo info;
+            info.name = name;
+            info.description = description;
+            info.path = path;
+            info.creationDate = QDateTime::fromString(creationStr, Qt::ISODateWithMs);
+            info.modificationDate = QDateTime::fromString(modificationStr, Qt::ISODateWithMs);
+            if (!info.creationDate.isValid()) info.creationDate = QDateTime::currentDateTime(); // Fallback
+            if (!info.modificationDate.isValid()) info.modificationDate = info.creationDate; // Fallback
+
+            d->profiles.insert(name, info);
+            LOG_DEBUG("ProfileManager: Loaded profile from list: " << name << " at " << path);
+        } else {
+            LOG_WARN("ProfileManager::loadProfileList: Non-object entry found in profiles array, skipping.");
+        }
+    }
+
+    LOG_INFO("ProfileManager: Loaded " << d->profiles.size() << " profiles from list file: " << listPath);
+    return true;
+}
+
+bool ProfileManager::saveProfileList() const
+{
+    QMutexLocker locker(&d->mutex);
+
+    QJsonArray profilesArray;
+    for (auto it = d->profiles.constBegin(); it != d->profiles.constEnd(); ++it) {
+        QJsonObject profileObj;
+        profileObj["name"] = it.key();
+        profileObj["description"] = it.value().description;
+        profileObj["path"] = it.value().path; // Store the full path
+        profileObj["creationDate"] = it.value().creationDate.toString(Qt::ISODateWithMs);
+        profileObj["modificationDate"] = it.value().modificationDate.toString(Qt::ISODateWithMs);
+        profilesArray.append(profileObj);
+    }
+
+    QJsonObject rootObj;
+    rootObj["profiles"] = profilesArray;
+
+    QJsonDocument doc(rootObj);
+
+    QString listPath = d->profilesDirectory + "/profiles.json";
+    QFile listFile(listPath);
+    if (!listFile.open(QIODevice::WriteOnly)) {
+        LOG_ERROR("ProfileManager: Failed to open profiles list file for writing: " << listPath << ", Error: " << listFile.errorString());
+        return false;
+    }
+
+    qint64 bytesWritten = listFile.write(doc.toJson());
+    listFile.close();
+
+    if (bytesWritten != doc.toJson().size()) {
+        LOG_ERROR("ProfileManager: Failed to write full profiles list file: " << listPath);
+        return false;
+    }
+
+    LOG_DEBUG("ProfileManager: Saved profiles list to: " << listPath);
+    return true;
+}
+
+QString ProfileManager::profilePathForName(const QString& profileName) const
+{
+    // Construct the expected path for a profile based on its name.
+    // Profile directories are named after the profile.
+    return d->profilesDirectory + "/" + profileName;
+}
+
+bool ProfileManager::loadSettingsFromPath(const QString& profilePath) const
+{
+    QString settingsPath = profilePath + "/settings.json"; // Or the format used by Settings
+    if (!QFileInfo::exists(settingsPath)) {
+        LOG_WARN("ProfileManager::loadSettingsFromPath: Settings file does not exist in profile: " << profilePath << ". Using defaults.");
+        Settings::instance().loadDefaults(); // Hypothetical method to reset to defaults
+        return true; // Not an error, just means the profile has default settings
+    }
+
+    if (Settings::instance().loadFromPath(settingsPath)) { // Assuming Settings has a loadFromPath method
+        LOG_DEBUG("ProfileManager: Loaded settings from profile path: " << settingsPath);
+        return true;
     } else {
-        LOG_WARN("saveCurrentProfile: Current profile ID '" << d->currentProfileId << "' not found in profiles list.");
+        LOG_ERROR("ProfileManager::loadSettingsFromPath: Failed to load settings from profile: " << settingsPath);
+        return false;
     }
 }
 
-void ProfileManager::loadCurrentProfile()
-{
-    // This function should load the application state (settings, window layout, etc.)
-    // from the directory of the *current* profile.
-    // It involves calling load methods on Settings, MainWindow (for layout), etc.
-    // reading them from files within the current profile's settingsDirectory.
-    QMutexLocker locker(&d->mutex);
-    if (d->currentProfileId.isEmpty()) {
-        LOG_WARN("loadCurrentProfile: No current profile set.");
-        return;
-    }
+class ProfileManager::Private {
+public:
+    Private(ProfileManager* q_ptr)
+        : q(q_ptr), initialized(false) {}
 
-    auto it = d->profiles.find(d->currentProfileId);
-    if (it != d->profiles.end()) {
-        QDir settingsDir = it->settingsDirectory;
-        QString settingsPath = settingsDir.filePath("settings.conf");
-        // Settings::instance().loadFromPath(settingsPath); // Hypothetical method
-        LOG_DEBUG("Loaded current profile state from: " << settingsDir.absolutePath());
-    } else {
-        LOG_WARN("loadCurrentProfile: Current profile ID '" << d->currentProfileId << "' not found in profiles list.");
-    }
-}
+    ProfileManager* q;
+    mutable QMutex mutex; // Protect access to the profiles map and current profile name
+    bool initialized;
+    QString profilesDirectory;
+    QString currentProfileName;
+    QHash<QString, ProfileInfo> profiles; // Map profile name -> ProfileInfo
 
-QDir ProfileManager::profileSettingsDirectory(const QString& profileId) const
-{
-    QMutexLocker locker(&d->mutex);
-    auto it = d->profiles.constFind(profileId);
-    if (it != d->profiles.constEnd()) {
-        return it->settingsDirectory;
-    }
-    return QDir(); // Return invalid QDir if profile not found
-}
-
-bool ProfileManager::profileExists(const QString& profileId) const
-{
-    QMutexLocker locker(&d->mutex);
-    return d->profiles.contains(profileId);
-}
+    struct ProfileInfo {
+        QString name;
+        QString description;
+        QString path; // Full path to the profile directory
+        QDateTime creationDate;
+        QDateTime modificationDate;
+    };
+};
 
 } // namespace QuantilyxDoc

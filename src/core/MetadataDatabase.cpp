@@ -8,171 +8,25 @@
  * (at your option) any later version.
  */
 #include "MetadataDatabase.h"
-#include "Document.h" // For updateMetadataFromDocument
 #include "Logger.h"
+#include "utils/FileUtils.h" // Assuming this exists
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QSqlRecord>
 #include <QSqlDriver>
 #include <QDir>
 #include <QStandardPaths>
 #include <QDateTime>
 #include <QMutex>
 #include <QMutexLocker>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
+#include <QVariantMap>
+#include <QVariantList>
+#include <QRegularExpression>
 #include <QDebug>
+#include <QCryptographicHash>
 
 namespace QuantilyxDoc {
-
-class MetadataDatabase::Private {
-public:
-    Private(MetadataDatabase* q_ptr)
-        : q(q_ptr), ready(false) {}
-
-    MetadataDatabase* q;
-    mutable QMutex mutex; // Protect access to the QSqlDatabase connection
-    bool ready;
-    QString dbPathStr;
-    QSqlDatabase sqlDb;
-
-    // Helper to create the necessary tables
-    bool createTables() {
-        // Use a transaction for efficiency
-        sqlDb.transaction();
-
-        // Main metadata table
-        QString createMetadataTable = R"(
-            CREATE TABLE IF NOT EXISTS document_metadata (
-                file_path TEXT PRIMARY KEY,
-                title TEXT,
-                author TEXT,
-                subject TEXT,
-                keywords TEXT, -- Store as JSON array string
-                creation_date TEXT, -- ISO datetime string
-                modification_date TEXT, -- ISO datetime string
-                format TEXT,
-                creator TEXT,
-                producer TEXT,
-                file_size INTEGER,
-                page_count INTEGER,
-                language TEXT,
-                custom_fields TEXT, -- JSON string for arbitrary fields
-                last_indexed TEXT -- ISO datetime string
-            );
-        )";
-
-        // Tags table (for many-to-many relationship with documents)
-        QString createTagsTable = R"(
-            CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tag_name TEXT UNIQUE NOT NULL
-            );
-        )";
-
-        // Junction table for document-tag association
-        QString createDocTagsTable = R"(
-            CREATE TABLE IF NOT EXISTS document_tags (
-                doc_file_path TEXT,
-                tag_id INTEGER,
-                FOREIGN KEY(doc_file_path) REFERENCES document_metadata(file_path) ON DELETE CASCADE,
-                FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY(doc_file_path, tag_id)
-            );
-        )";
-
-        QSqlQuery query(sqlDb);
-        if (!query.exec(createMetadataTable)) {
-            LOG_ERROR("MetadataDatabase: Failed to create metadata table: " << query.lastError().text());
-            sqlDb.rollback();
-            return false;
-        }
-        if (!query.exec(createTagsTable)) {
-            LOG_ERROR("MetadataDatabase: Failed to create tags table: " << query.lastError().text());
-            sqlDb.rollback();
-            return false;
-        }
-        if (!query.exec(createDocTagsTable)) {
-            LOG_ERROR("MetadataDatabase: Failed to create document_tags table: " << query.lastError().text());
-            sqlDb.rollback();
-            return false;
-        }
-
-        // Create indexes for faster queries
-        QString createPathIndex = "CREATE INDEX IF NOT EXISTS idx_doc_path ON document_metadata(file_path);";
-        QString createAuthorIndex = "CREATE INDEX IF NOT EXISTS idx_author ON document_metadata(author);";
-        QString createFormatIndex = "CREATE INDEX IF NOT EXISTS idx_format ON document_metadata(format);";
-        QString createKeywordIndex = "CREATE INDEX IF NOT EXISTS idx_keywords ON document_metadata(keywords);"; // Might be slow on JSON, consider full-text search
-
-        for (const QString& indexSql : {createPathIndex, createAuthorIndex, createFormatIndex, createKeywordIndex}) {
-            if (!query.exec(indexSql)) {
-                LOG_WARN("MetadataDatabase: Failed to create index: " << query.lastError().text()); // Non-fatal
-            }
-        }
-
-        sqlDb.commit();
-        LOG_DEBUG("MetadataDatabase: Tables created/verified successfully.");
-        return true;
-    }
-
-    // Helper to convert DocumentMetadata to SQL query values
-    QVariantMap metadataToSqlValues(const DocumentMetadata& metadata) const {
-        QVariantMap values;
-        values[":file_path"] = metadata.filePath;
-        values[":title"] = metadata.title;
-        values[":author"] = metadata.author;
-        values[":subject"] = metadata.subject;
-        values[":keywords"] = QJsonDocument(QJsonArray::fromStringList(metadata.keywords)).toJson(QJsonDocument::Compact);
-        values[":creation_date"] = metadata.creationDate.toString(Qt::ISODateWithMs);
-        values[":modification_date"] = metadata.modificationDate.toString(Qt::ISODateWithMs);
-        values[":format"] = metadata.format;
-        values[":creator"] = metadata.creator;
-        values[":producer"] = metadata.producer;
-        values[":file_size"] = metadata.fileSize;
-        values[":page_count"] = metadata.pageCount;
-        values[":language"] = metadata.language;
-        values[":custom_fields"] = metadata.customFields;
-        values[":last_indexed"] = metadata.lastIndexed.toString(Qt::ISODateWithMs);
-        return values;
-    }
-
-    // Helper to convert SQL query results to DocumentMetadata
-    DocumentMetadata sqlValuesToMetadata(const QSqlQuery& query) const {
-        DocumentMetadata metadata;
-        metadata.filePath = query.value("file_path").toString();
-        metadata.title = query.value("title").toString();
-        metadata.author = query.value("author").toString();
-        metadata.subject = query.value("subject").toString();
-
-        QString keywordsJson = query.value("keywords").toString();
-        if (!keywordsJson.isEmpty()) {
-            QJsonParseError error;
-            QJsonDocument doc = QJsonDocument::fromJson(keywordsJson.toUtf8(), &error);
-            if (error.error == QJsonParseError::NoError && doc.isArray()) {
-                QStringList keywords;
-                for (const auto& value : doc.array()) {
-                    if (value.isString()) {
-                        keywords.append(value.toString());
-                    }
-                }
-                metadata.keywords = keywords;
-            }
-        }
-
-        metadata.creationDate = QDateTime::fromString(query.value("creation_date").toString(), Qt::ISODateWithMs);
-        metadata.modificationDate = QDateTime::fromString(query.value("modification_date").toString(), Qt::ISODateWithMs);
-        metadata.format = query.value("format").toString();
-        metadata.creator = query.value("creator").toString();
-        metadata.producer = query.value("producer").toString();
-        metadata.fileSize = query.value("file_size").toLongLong();
-        metadata.pageCount = query.value("page_count").toInt();
-        metadata.language = query.value("language").toString();
-        metadata.customFields = query.value("custom_fields").toString();
-        metadata.lastIndexed = QDateTime::fromString(query.value("last_indexed").toString(), Qt::ISODateWithMs);
-        return metadata;
-    }
-};
 
 // Static instance pointer
 MetadataDatabase* MetadataDatabase::s_instance = nullptr;
@@ -194,8 +48,8 @@ MetadataDatabase::MetadataDatabase(QObject* parent)
 
 MetadataDatabase::~MetadataDatabase()
 {
-    if (d->sqlDb.isOpen()) {
-        d->sqlDb.close();
+    if (d->db.isOpen()) {
+        d->db.close();
     }
     LOG_INFO("MetadataDatabase destroyed.");
 }
@@ -204,391 +58,462 @@ bool MetadataDatabase::initialize(const QString& dbPath)
 {
     QMutexLocker locker(&d->mutex);
 
-    if (d->ready) {
+    if (d->initialized) {
         LOG_WARN("MetadataDatabase::initialize: Already initialized.");
         return true;
     }
 
-    QString path = dbPath;
-    if (path.isEmpty()) {
-        // Use a default path, e.g., in the application data directory
-        path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/quantilyxdoc_metadata.db";
-        QDir().mkpath(QFileInfo(path).absolutePath()); // Ensure directory exists
-    }
+    d->dbPathStr = dbPath.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/metadata.db" : dbPath;
 
-    // Add a unique connection name to avoid conflicts with other parts of the application using QSqlDatabase
-    QString connectionName = "metadata_db_connection";
-    d->sqlDb = QSqlDatabase::addDatabase("QSQLITE", connectionName); // Use SQLite driver
-    d->sqlDb.setDatabaseName(path);
-    // d->sqlDb.setUserName(...); // Not typically needed for SQLite
-    // d->sqlDb.setPassword(...); // Not typically needed for SQLite
-    d->sqlDb.setConnectOptions("QSQLITE_OPEN_URI"); // Allow URI filenames
+    // Ensure the directory exists
+    QFileInfo dbInfo(d->dbPathStr);
+    QDir().mkpath(dbInfo.absolutePath());
 
-    if (!d->sqlDb.open()) {
-        LOG_ERROR("MetadataDatabase: Failed to open database: " << d->sqlDb.lastError().text());
-        d->ready = false;
+    // Add a unique connection name to avoid conflicts if other parts of the app use QSqlDatabase
+    QString connectionName = "metadata_db_connection_" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    d->db = QSqlDatabase::addDatabase("QSQLITE", connectionName);
+    d->db.setDatabaseName(d->dbPathStr);
+
+    if (!d->db.open()) {
+        LOG_ERROR("MetadataDatabase: Failed to open SQLite database: " << d->db.lastError().text());
         return false;
     }
 
-    if (!d->createTables()) {
-        LOG_ERROR("MetadataDatabase: Failed to create tables.");
-        d->ready = false;
-        d->sqlDb.close();
+    // Enable foreign keys (good practice for referential integrity)
+    QSqlQuery pragmaForeignKey(d->db);
+    if (!pragmaForeignKey.exec("PRAGMA foreign_keys = ON;")) {
+        LOG_WARN("MetadataDatabase: Could not enable foreign keys: " << pragmaForeignKey.lastError().text());
+        // This might be acceptable depending on the schema, but it's generally good to have them on.
+    }
+
+    // Create tables if they don't exist
+    if (!createTables()) {
+        LOG_ERROR("MetadataDatabase: Failed to create required tables.");
+        d->db.close();
         return false;
     }
 
-    d->dbPathStr = path;
-    d->ready = true;
-    LOG_INFO("MetadataDatabase: Initialized successfully at: " << path);
+    d->initialized = true;
+    LOG_INFO("MetadataDatabase initialized successfully at: " << d->dbPathStr);
+    emit initialized(true);
     return true;
 }
 
-bool MetadataDatabase::isReady() const
+bool MetadataDatabase::isInitialized() const
 {
     QMutexLocker locker(&d->mutex);
-    return d->ready;
+    return d->initialized && d->db.isOpen();
 }
 
-bool MetadataDatabase::storeMetadata(const DocumentMetadata& metadata)
+bool MetadataDatabase::storeMetadata(const QString& filePath, const QVariantMap& metadata)
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::storeMetadata: Database is not ready.");
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::storeMetadata: Database is not initialized.");
         return false;
     }
 
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
-    query.prepare(R"(
-        INSERT OR REPLACE INTO document_metadata
-        (file_path, title, author, subject, keywords, creation_date, modification_date, format, creator, producer, file_size, page_count, language, custom_fields, last_indexed)
-        VALUES (:file_path, :title, :author, :subject, :keywords, :creation_date, :modification_date, :format, :creator, :producer, :file_size, :page_count, :language, :custom_fields, :last_indexed)
-    )");
-
-    QVariantMap values = d->metadataToSqlValues(metadata);
-    for (auto it = values.constBegin(); it != values.constEnd(); ++it) {
-        query.bindValue(it.key(), it.value());
+    // Calculate file hash for uniqueness/duplicate detection
+    QFile file(filePath);
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!file.open(QIODevice::ReadOnly) || !hash.addData(&file)) {
+        LOG_ERROR("MetadataDatabase::storeMetadata: Failed to calculate hash for file: " << filePath);
+        return false;
     }
+    QString fileHash = hash.result().toHex();
+
+    QSqlQuery query(d->db);
+    // Use UPSERT (INSERT ... ON CONFLICT ... DO UPDATE in SQLite 3.24+)
+    // Or use REPLACE INTO (which deletes and re-inserts)
+    // Or SELECT first then INSERT/UPDATE.
+    // Let's use INSERT OR REPLACE for simplicity, though UPSERT is more efficient if available.
+    // Schema: files (id INTEGER PRIMARY KEY, path TEXT UNIQUE, hash TEXT UNIQUE, size INTEGER, ...)
+    // metadata_table (file_id INTEGER, key TEXT, value TEXT, FOREIGN KEY(file_id) REFERENCES files(id))
+    // This requires a join or separate inserts/updates.
+
+    // First, upsert the file record to get its ID
+    query.prepare("INSERT OR REPLACE INTO files (path, hash, size, last_modified) VALUES (?, ?, ?, ?);");
+    QFileInfo info(filePath);
+    query.addBindValue(filePath);
+    query.addBindValue(fileHash);
+    query.addBindValue(info.size());
+    query.addBindValue(info.lastModified().toMSecsSinceEpoch() / 1000); // Store as seconds since epoch
 
     if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Failed to store metadata for " << metadata.filePath << ": " << query.lastError().text());
+        LOG_ERROR("MetadataDatabase::storeMetadata: Failed to upsert file record: " << query.lastError().text());
         return false;
     }
 
-    LOG_DEBUG("MetadataDatabase: Stored metadata for: " << metadata.filePath);
-    emit metadataStored(metadata.filePath);
-    emit databaseContentChanged();
-    return true;
+    // Get the inserted/updated file ID
+    qint64 fileId = d->db.lastInsertId().toLongLong();
+    if (fileId == 0) {
+        // If lastInsertId is 0, it might mean the row existed and was updated.
+        // We need to fetch the ID explicitly.
+        QSqlQuery idQuery(d->db);
+        idQuery.prepare("SELECT id FROM files WHERE path = ?;");
+        idQuery.addBindValue(filePath);
+        if (idQuery.exec() && idQuery.next()) {
+            fileId = idQuery.value(0).toLongLong();
+        } else {
+            LOG_ERROR("MetadataDatabase::storeMetadata: Failed to get file ID after upsert.");
+            return false;
+        }
+    }
+
+    // Clear existing metadata for this file ID (optional, depending on merge strategy)
+    // QSqlQuery clearQuery(d->db);
+    // clearQuery.prepare("DELETE FROM metadata WHERE file_id = ?;");
+    // clearQuery.addBindValue(fileId);
+    // if (!clearQuery.exec()) { ... handle error ... }
+
+    // Insert/update metadata key-value pairs
+    QSqlQuery metadataQuery(d->db);
+    metadataQuery.prepare("INSERT OR REPLACE INTO metadata (file_id, key, value) VALUES (?, ?, ?);");
+    bool success = true;
+    for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
+        metadataQuery.addBindValue(fileId);
+        metadataQuery.addBindValue(it.key());
+        metadataQuery.addBindValue(it.value().toString()); // Store all values as strings for simplicity, or use BLOB for complex types
+        if (!metadataQuery.exec()) {
+            LOG_ERROR("MetadataDatabase::storeMetadata: Failed to upsert metadata for key '" << it.key() << "', file: " << filePath << ", Error: " << metadataQuery.lastError().text());
+            success = false; // Keep going to try other keys
+        }
+    }
+
+    if (success) {
+        LOG_DEBUG("MetadataDatabase: Stored metadata for file: " << filePath);
+        emit metadataStored(filePath);
+    }
+    return success;
 }
 
-DocumentMetadata MetadataDatabase::retrieveMetadata(const QString& filePath) const
+QVariantMap MetadataDatabase::retrieveMetadata(const QString& filePath) const
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::retrieveMetadata: Database is not ready.");
-        return DocumentMetadata(); // Return invalid metadata
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::retrieveMetadata: Database is not initialized.");
+        return QVariantMap();
     }
 
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT * FROM document_metadata WHERE file_path = :file_path;");
-    query.bindValue(":file_path", filePath);
+    QSqlQuery query(d->db);
+    query.prepare("SELECT m.key, m.value FROM metadata m JOIN files f ON m.file_id = f.id WHERE f.path = ?;");
+    query.addBindValue(filePath);
 
-    if (!query.exec() || !query.next()) {
-        if (query.lastError().isValid()) {
-            LOG_ERROR("MetadataDatabase: Query failed for " << filePath << ": " << query.lastError().text());
-        } else {
-            LOG_DEBUG("MetadataDatabase: No metadata found for: " << filePath);
-        }
-        return DocumentMetadata(); // Return invalid metadata
+    if (!query.exec()) {
+        LOG_ERROR("MetadataDatabase::retrieveMetadata: Query failed: " << query.lastError().text());
+        return QVariantMap();
     }
 
-    DocumentMetadata metadata = d->sqlValuesToMetadata(query);
-    LOG_DEBUG("MetadataDatabase: Retrieved metadata for: " << filePath);
+    QVariantMap metadata;
+    while (query.next()) {
+        QString key = query.value(0).toString();
+        QString value = query.value(1).toString(); // Retrieve as string, cast later if needed
+        metadata.insert(key, value);
+    }
+
+    LOG_DEBUG("MetadataDatabase: Retrieved metadata for file: " << filePath << " (Keys: " << metadata.keys().size() << ")");
     return metadata;
 }
 
 bool MetadataDatabase::removeMetadata(const QString& filePath)
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::removeMetadata: Database is not ready.");
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::removeMetadata: Database is not initialized.");
         return false;
     }
 
     QMutexLocker locker(&d->mutex);
 
-    // Deleting from document_metadata will cascade delete from document_tags due to foreign key constraint
-    QSqlQuery query(d->sqlDb);
-    query.prepare("DELETE FROM document_metadata WHERE file_path = :file_path;");
-    query.bindValue(":file_path", filePath);
+    QSqlQuery query(d->db);
+    query.prepare("DELETE FROM files WHERE path = ?;"); // CASCADE DELETE should remove associated metadata if FKs are on
+    query.addBindValue(filePath);
 
     if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Failed to remove metadata for " << filePath << ": " << query.lastError().text());
+        LOG_ERROR("MetadataDatabase::removeMetadata: Failed to delete file record: " << query.lastError().text());
         return false;
     }
 
     if (query.numRowsAffected() > 0) {
-        LOG_DEBUG("MetadataDatabase: Removed metadata for: " << filePath);
+        LOG_DEBUG("MetadataDatabase: Removed metadata for file: " << filePath);
         emit metadataRemoved(filePath);
-        emit databaseContentChanged();
+        return true;
     } else {
-        LOG_DEBUG("MetadataDatabase: No metadata entry found to remove for: " << filePath);
+        LOG_WARN("MetadataDatabase::removeMetadata: No metadata record found for file: " << filePath);
+        return false; // Or true? Semantically, the metadata is "removed" (doesn't exist anymore).
     }
-    return true;
 }
 
-QList<DocumentMetadata> MetadataDatabase::queryMetadata(const QString& queryString, int limit, int offset) const
+QList<MetadataDatabase::SearchResult> MetadataDatabase::searchMetadata(const QString& query, const QStringList& keys) const
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::queryMeta Database is not ready.");
-        return {}; // Return empty list
+    if (!isInitialized() || query.isEmpty()) {
+        LOG_ERROR("MetadataDatabase::searchMetadata: Database not initialized or query is empty.");
+        return QList<SearchResult>();
     }
 
     QMutexLocker locker(&d->mutex);
 
-    // WARNING: Directly inserting the queryString into the SQL is DANGEROUS if it comes from user input.
-    // This example assumes queryString is a trusted, pre-sanitized internal query string or a specific field name/value pair.
-    // A safer approach would be to build the WHERE clause programmatically based on a structured query object.
-    // Example of safer query building:
-    // QString baseQuery = "SELECT * FROM document_metadata ";
-    // QStringList conditions;
-    // QVariantMap params; // Use bound values for user-provided data
-    // if (!author.isEmpty()) {
-    //     conditions.append("author = :author");
-    //     params[":author"] = author;
-    // }
-    // if (!titleKeyword.isEmpty()) {
-    //     conditions.append("title LIKE :title");
-    //     params[":title"] = "%" + titleKeyword + "%";
-    // }
-    // QString fullQuery = baseQuery;
-    // if (!conditions.isEmpty()) {
-    //     fullQuery += "WHERE " + conditions.join(" AND ");
-    // }
-    // fullQuery += " LIMIT :limit OFFSET :offset;";
-    // query.prepare(fullQuery);
-    // for (auto it = params.constBegin(); it != params.constEnd(); ++it) {
-    //     query.bindValue(it.key(), it.value());
-    // }
-    // query.bindValue(":limit", limit);
-    // query.bindValue(":offset", offset);
+    QSqlQuery sqlQuery(d->db);
 
-    // For now, let's use a placeholder query that just selects everything with limit/offset
-    QString fullQuery = "SELECT * FROM document_metadata "; // Add WHERE clause based on queryString if it's a structured query
-    if (limit > 0) {
-        fullQuery += QString("LIMIT %1 ").arg(limit);
-        if (offset > 0) {
-            fullQuery += QString("OFFSET %1 ").arg(offset);
+    // Build the WHERE clause based on keys and query string
+    QString whereClause = "m.value LIKE ? ESCAPE '\\' ";
+    QStringList bindValues;
+    bindValues.append("%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"); // Escape LIKE wildcards
+
+    if (!keys.isEmpty()) {
+        QString keyConditions = " AND (";
+        QStringList keyParts;
+        for (const QString& key : keys) {
+            keyParts.append("m.key = ?");
+            bindValues.append(key);
         }
-    }
-    fullQuery += ";"; // Ensure query ends
-
-    QSqlQuery query(d->sqlDb);
-    // For a real implementation, queryString should be used to build the WHERE clause safely.
-    // query.prepare(queryString); // DO NOT DO THIS WITH USER INPUT
-    query.prepare(fullQuery); // Use the built query
-
-    if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Query failed: " << query.lastError().text() << ", Query: " << fullQuery);
-        return {}; // Return empty list on error
+        keyConditions += keyParts.join(" OR ") + ")";
+        whereClause += keyConditions;
     }
 
-    QList<DocumentMetadata> results;
-    while (query.next()) {
-        results.append(d->sqlValuesToMetadata(query));
+    // Join files and metadata tables
+    QString queryString = "SELECT f.path, m.key, m.value FROM files f JOIN metadata m ON f.id = m.file_id WHERE " + whereClause + ";";
+    sqlQuery.prepare(queryString);
+
+    for (const QString& val : bindValues) {
+        sqlQuery.addBindValue(val);
     }
 
-    LOG_DEBUG("MetadataDatabase: Query returned " << results.size() << " results.");
-    emit queryExecuted(results);
+    if (!sqlQuery.exec()) {
+        LOG_ERROR("MetadataDatabase::searchMetadata: Query failed: " << sqlQuery.lastError().text());
+        return QList<SearchResult>();
+    }
+
+    QList<SearchResult> results;
+    while (sqlQuery.next()) {
+        SearchResult result;
+        result.filePath = sqlQuery.value(0).toString(); // f.path
+        result.key = sqlQuery.value(1).toString();      // m.key
+        result.value = sqlQuery.value(2).toString();    // m.value
+        results.append(result);
+    }
+
+    LOG_DEBUG("MetadataDatabase: Search query '" << query << "' returned " << results.size() << " results.");
     return results;
 }
 
-QStringList MetadataDatabase::getAllTags() const
+QStringList MetadataDatabase::getAllKeys() const
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::getAllTags: Database is not ready.");
-        return {}; // Return empty list
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::getAllKeys: Database is not initialized.");
+        return QStringList();
     }
 
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT DISTINCT tag_name FROM tags ORDER BY tag_name ASC;");
+    QSqlQuery query(d->db);
+    query.prepare("SELECT DISTINCT key FROM metadata ORDER BY key ASC;");
 
     if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Failed to get all tags: " << query.lastError().text());
-        return {}; // Return empty list on error
+        LOG_ERROR("MetadataDatabase::getAllKeys: Query failed: " << query.lastError().text());
+        return QStringList();
     }
 
-    QStringList tags;
+    QStringList keys;
     while (query.next()) {
-        tags.append(query.value("tag_name").toString());
+        keys.append(query.value(0).toString());
     }
 
-    LOG_DEBUG("MetadataDatabase: Retrieved " << tags.size() << " unique tags.");
-    return tags;
+    LOG_DEBUG("MetadataDatabase: Retrieved " << keys.size() << " unique metadata keys.");
+    return keys;
 }
 
-QStringList MetadataDatabase::getAllAuthors() const
+QStringList MetadataDatabase::getAllFilePaths() const
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::getAllAuthors: Database is not ready.");
-        return {}; // Return empty list
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::getAllFilePaths: Database is not initialized.");
+        return QStringList();
     }
 
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT DISTINCT author FROM document_metadata WHERE author IS NOT NULL AND author != '' ORDER BY author ASC;");
+    QSqlQuery query(d->db);
+    query.prepare("SELECT path FROM files ORDER BY path ASC;");
 
     if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Failed to get all authors: " << query.lastError().text());
-        return {}; // Return empty list on error
+        LOG_ERROR("MetadataDatabase::getAllFilePaths: Query failed: " << query.lastError().text());
+        return QStringList();
     }
 
-    QStringList authors;
+    QStringList paths;
     while (query.next()) {
-        authors.append(query.value("author").toString());
+        paths.append(query.value(0).toString());
     }
 
-    LOG_DEBUG("MetadataDatabase: Retrieved " << authors.size() << " unique authors.");
-    return authors;
+    LOG_DEBUG("MetadataDatabase: Retrieved " << paths.size() << " unique file paths.");
+    return paths;
 }
 
-QStringList MetadataDatabase::getAllFormats() const
+int MetadataDatabase::entryCount() const
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::getAllFormats: Database is not ready.");
-        return {}; // Return empty list
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::entryCount: Database is not initialized.");
+        return -1;
     }
 
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT DISTINCT format FROM document_metadata WHERE format IS NOT NULL AND format != '' ORDER BY format ASC;");
-
-    if (!query.exec()) {
-        LOG_ERROR("MetadataDatabase: Failed to get all formats: " << query.lastError().text());
-        return {}; // Return empty list on error
-    }
-
-    QStringList formats;
-    while (query.next()) {
-        formats.append(query.value("format").toString());
-    }
-
-    LOG_DEBUG("MetadataDatabase: Retrieved " << formats.size() << " unique formats.");
-    return formats;
-}
-
-int MetadataDatabase::documentCount() const
-{
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::documentCount: Database is not ready.");
-        return 0; // Return 0 on error
-    }
-
-    QMutexLocker locker(&d->mutex);
-
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT COUNT(*) AS count FROM document_metadata;");
+    QSqlQuery query(d->db);
+    query.prepare("SELECT COUNT(*) FROM metadata;");
 
     if (!query.exec() || !query.next()) {
-        LOG_ERROR("MetadataDatabase: Failed to count documents: " << (query.lastError().isValid() ? query.lastError().text() : "No result"));
-        return 0; // Return 0 on error
+        LOG_ERROR("MetadataDatabase::entryCount: Query failed: " << (query.isValid() ? query.lastError().text() : "No result"));
+        return -1;
     }
 
-    int count = query.value("count").toInt();
-    LOG_DEBUG("MetadataDatabase: Total documents indexed: " << count);
+    int count = query.value(0).toInt();
+    LOG_DEBUG("MetadataDatabase: Total metadata entries: " << count);
     return count;
 }
 
-qint64 MetadataDatabase::totalDocumentsSize() const
+void MetadataDatabase::beginTransaction()
 {
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::totalDocumentsSize: Database is not ready.");
-        return 0; // Return 0 on error
+    if (isInitialized()) {
+        QMutexLocker locker(&d->mutex);
+        if (!d->db.transaction()) {
+            LOG_ERROR("MetadataDatabase::beginTransaction: Failed to start transaction: " << d->db.lastError().text());
+        } else {
+            LOG_DEBUG("MetadataDatabase: Transaction begun.");
+        }
     }
-
-    QMutexLocker locker(&d->mutex);
-
-    QSqlQuery query(d->sqlDb);
-    query.prepare("SELECT SUM(file_size) AS total_size FROM document_metadata;");
-
-    if (!query.exec() || !query.next()) {
-        LOG_ERROR("MetadataDatabase: Failed to calculate total size: " << (query.lastError().isValid() ? query.lastError().text() : "No result"));
-        return 0; // Return 0 on error
-    }
-
-    qint64 totalSize = query.value("total_size").toLongLong();
-    LOG_DEBUG("MetadataDatabase: Total size of indexed documents: " << totalSize << " bytes.");
-    return totalSize;
 }
 
-bool MetadataDatabase::updateMetadataFromDocument(Document* document)
+void MetadataDatabase::commitTransaction()
 {
-    if (!document) {
-        LOG_ERROR("MetadataDatabase::updateMetadataFromDocument: Null document provided.");
+    if (isInitialized()) {
+        QMutexLocker locker(&d->mutex);
+        if (!d->db.commit()) {
+            LOG_ERROR("MetadataDatabase::commitTransaction: Failed to commit transaction: " << d->db.lastError().text());
+        } else {
+            LOG_DEBUG("MetadataDatabase: Transaction committed.");
+        }
+    }
+}
+
+void MetadataDatabase::rollbackTransaction()
+{
+    if (isInitialized()) {
+        QMutexLocker locker(&d->mutex);
+        if (!d->db.rollback()) {
+            LOG_ERROR("MetadataDatabase::rollbackTransaction: Failed to rollback transaction: " << d->db.lastError().text());
+        } else {
+            LOG_DEBUG("MetadataDatabase: Transaction rolled back.");
+        }
+    }
+}
+
+bool MetadataDatabase::vacuum()
+{
+    if (!isInitialized()) {
+        LOG_ERROR("MetadataDatabase::vacuum: Database is not initialized.");
         return false;
     }
 
-    // Extract metadata from the Document object.
-    // This requires the Document class to have methods for all metadata fields.
-    DocumentMetadata metadata;
-    metadata.filePath = document->filePath(); // Assuming Document has this
-    metadata.title = document->title(); // Assuming Document has this
-    metadata.author = document->author(); // Assuming Document has this
-    metadata.subject = document->subject(); // Assuming Document has this
-    metadata.keywords = document->keywords(); // Assuming Document has this
-    metadata.creationDate = document->creationDate(); // Assuming Document has this
-    metadata.modificationDate = document->modificationDate(); // Assuming Document has this
-    metadata.format = document->formatVersion(); // Assuming Document has this
-    metadata.creator = document->creator(); // Assuming Document has this (or get from specific format handlers)
-    metadata.producer = document->producer(); // Assuming Document has this (or get from specific format handlers)
-    metadata.fileSize = document->fileSize(); // Assuming Document has this
-    metadata.pageCount = document->pageCount(); // Assuming Document has this
-    metadata.language = document->language(); // Assuming Document has this
-    // metadata.customFields = ...; // Could store format-specific fields as JSON
-    metadata.lastIndexed = QDateTime::currentDateTime();
-
-    return storeMetadata(metadata);
-}
-
-void MetadataDatabase::vacuum()
-{
-    if (!isReady()) {
-        LOG_ERROR("MetadataDatabase::vacuum: Database is not ready.");
-        return;
-    }
-
     QMutexLocker locker(&d->mutex);
 
-    QSqlQuery query(d->sqlDb);
+    QSqlQuery query(d->db);
     if (!query.exec("VACUUM;")) {
-        LOG_ERROR("MetadataDatabase: Vacuum operation failed: " << query.lastError().text());
+        LOG_ERROR("MetadataDatabase::vacuum: VACUUM command failed: " << query.lastError().text());
+        return false;
+    }
+
+    LOG_INFO("MetadataDatabase: VACUUM completed successfully.");
+    return true;
+}
+
+bool MetadataDatabase::createTables()
+{
+    // Transaction for creating tables atomically
+    if (!d->db.transaction()) {
+         LOG_ERROR("MetadataDatabase::createTables: Failed to start transaction for table creation.");
+         return false;
+    }
+
+    bool success = true;
+    QSqlQuery query(d->db);
+
+    // Create 'files' table to store basic file information
+    QString createFilesTable = R"(
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT UNIQUE NOT NULL,
+            hash TEXT UNIQUE, -- SHA256 hash of the file content
+            size INTEGER,
+            last_modified INTEGER, -- Unix timestamp (seconds since epoch)
+            created_at INTEGER DEFAULT (unixepoch('now')) -- When this record was added to the DB
+        );
+    )";
+
+    if (!query.exec(createFilesTable)) {
+        LOG_ERROR("MetadataDatabase::createTables: Failed to create 'files' table: " << query.lastError().text());
+        success = false;
+    }
+
+    // Create 'metadata' table to store key-value pairs associated with files
+    QString createMetadataTable = R"(
+        CREATE TABLE IF NOT EXISTS metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            created_at INTEGER DEFAULT (unixepoch('now')),
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        );
+    )";
+
+    if (success && !query.exec(createMetadataTable)) {
+        LOG_ERROR("MetadataDatabase::createTables: Failed to create 'metadata' table: " << query.lastError().text());
+        success = false;
+    }
+
+    // Create indexes for performance
+    QString createPathIndex = "CREATE INDEX IF NOT EXISTS idx_files_path ON files (path);";
+    QString createHashIndex = "CREATE INDEX IF NOT EXISTS idx_files_hash ON files (hash);";
+    QString createMetadataFileIndex = "CREATE INDEX IF NOT EXISTS idx_metadata_file_id ON metadata (file_id);";
+    QString createMetadataKeyIndex = "CREATE INDEX IF NOT EXISTS idx_metadata_key ON metadata (key);";
+
+    for (const QString& indexSql : {createPathIndex, createHashIndex, createMetadataFileIndex, createMetadataKeyIndex}) {
+        if (success && !query.exec(indexSql)) {
+            LOG_WARN("MetadataDatabase::createTables: Failed to create index: " << query.lastError().text() << ". SQL: " << indexSql);
+            // Index creation failure is not fatal, but degrades performance.
+            // success = true; // Keep success as true for indexes
+        }
+    }
+
+    if (success) {
+        if (!d->db.commit()) {
+            LOG_ERROR("MetadataDatabase::createTables: Failed to commit table creation transaction: " << d->db.lastError().text());
+            success = false;
+        } else {
+            LOG_DEBUG("MetadataDatabase::createTables: Tables created successfully.");
+        }
     } else {
-        LOG_INFO("MetadataDatabase: Vacuum operation completed.");
+        if (!d->db.rollback()) {
+            LOG_ERROR("MetadataDatabase::createTables: Failed to rollback failed table creation: " << d->db.lastError().text());
+        } else {
+            LOG_DEBUG("MetadataDatabase::createTables: Rolled back failed table creation.");
+        }
     }
+
+    return success;
 }
 
-QString MetadataDatabase::databasePath() const
-{
-    QMutexLocker locker(&d->mutex);
-    return d->dbPathStr;
-}
+class MetadataDatabase::Private {
+public:
+    Private(MetadataDatabase* q_ptr)
+        : q(q_ptr), initialized(false) {}
 
-bool MetadataDatabase::setDatabasePath(const QString& path)
-{
-    // This function sets the *desired* path but doesn't change the currently open database connection.
-    // To use a new path, the database must be closed and reopened with initialize(newPath).
-    // For now, just store the path if it's different.
-    QMutexLocker locker(&d->mutex);
-    if (d->dbPathStr != path) {
-        d->dbPathStr = path;
-        LOG_INFO("MetadataDatabase: Database path set to: " << path << " (Reinitialize to use).");
-        return true;
-    }
-    return false; // Path was already set
-}
+    MetadataDatabase* q;
+    mutable QMutex mutex; // Protect database access across threads if needed
+    bool initialized;
+    QString dbPathStr;
+    QSqlDatabase db;
+};
 
 } // namespace QuantilyxDoc

@@ -18,17 +18,12 @@
 #include "core/CrashHandler.h"
 #include "core/ProfileManager.h"
 #include "core/MetadataDatabase.h"
-#include "core/DuplicateDetector.h"
 #include "search/FullTextIndex.h"
 #include "automation/MacroRecorder.h"
 #include "automation/ScriptingEngine.h"
 #include "security/PasswordRemover.h"
 #include "security/RestrictionBypass.h"
 #include "ocr/OcrEngine.h"
-#include "ui/CommandPalette.h"
-#include "ui/QuickActionsPanel.h"
-#include "ui/AboutDialog.h"
-#include "ui/PreferencesDialog.h"
 #include <QDir>
 #include <QStandardPaths>
 #include <QFileInfo>
@@ -38,9 +33,8 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QMetaType> // For registering custom types if needed
-#include <QElapsedTimer> // For timing initialization steps
 #include <QDebug>
-#include <QThread> // For potential thread management during init
+#include <QElapsedTimer> // For timing initialization steps
 
 // Register custom types if any are used across threads/signals
 // Q_DECLARE_METATYPE(MyCustomType)
@@ -198,15 +192,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 8. Initialize Duplicate Detector (uses MetadataDatabase)
-    if (initSuccess) {
-        LOG_DEBUG("Initializing DuplicateDetector...");
-        // DuplicateDetector might need access to MetadataDB or other indexing systems.
-        // QuantilyxDoc::DuplicateDetector::instance().setMetadataDatabase(&MetadataDatabase::instance());
-        LOG_INFO("DuplicateDetector initialized.");
-    }
-
-    // 9. Initialize Full-Text Index (opens connection/file, potentially loads cache)
+    // 8. Initialize Full-Text Index (opens connection/file, potentially loads cache)
     if (initSuccess) {
         LOG_DEBUG("Initializing FullTextIndex...");
         QString indexPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/fts_index";
@@ -219,7 +205,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 10. Initialize Password Remover (locates external tools like QPDF)
+    // 9. Initialize Password Remover (locates external tools like QPDF)
     if (initSuccess) {
         LOG_DEBUG("Initializing PasswordRemover...");
         // PasswordRemover might search for 'qpdf' executable or similar during initialization.
@@ -227,7 +213,7 @@ int main(int argc, char *argv[])
         LOG_INFO("PasswordRemover initialized (external tools located).");
     }
 
-    // 11. Initialize Restriction Bypass (locates external tools like QPDF)
+    // 10. Initialize Restriction Bypass (locates external tools like QPDF)
     if (initSuccess) {
         LOG_DEBUG("Initializing RestrictionBypass...");
         // RestrictionBypass might search for 'qpdf' executable or similar during initialization.
@@ -235,7 +221,7 @@ int main(int argc, char *argv[])
         LOG_INFO("RestrictionBypass initialized (external tools located).");
     }
 
-    // 12. Initialize OCR Engine (loads language data, initializes Tesseract/PaddleOCR)
+    // 11. Initialize OCR Engine (loads language data, initializes Tesseract/PaddleOCR)
     if (initSuccess) {
         LOG_DEBUG("Initializing OcrEngine...");
         QString lang = QuantilyxDoc::Settings::instance().value<QString>("Ocr/Language", "eng");
@@ -249,14 +235,14 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 13. Initialize Macro Recorder
+    // 12. Initialize Macro Recorder
     if (initSuccess) {
         LOG_DEBUG("Initializing MacroRecorder...");
         // QuantilyxDoc::MacroRecorder::instance(); // Singleton created/accessed, might initialize in constructor
         LOG_INFO("MacroRecorder initialized.");
     }
 
-    // 14. Initialize Scripting Engine (loads language interpreter if applicable)
+    // 13. Initialize Scripting Engine (loads language interpreter if applicable)
     if (initSuccess) {
         LOG_DEBUG("Initializing ScriptingEngine...");
         // QString scriptLanguage = Settings::instance().value<QString>("Scripting/Language", "python");
@@ -269,7 +255,7 @@ int main(int argc, char *argv[])
         LOG_INFO("ScriptingEngine initialized (language loading deferred until first script run or preference change).");
     }
 
-    // 15. Initialize Plugins (if enabled)
+    // 14. Initialize Plugins (if enabled)
     if (initSuccess && !disablePlugins) {
         LOG_DEBUG("Initializing Plugins...");
         // The Application class might have a method to load plugins based on settings or a list.
@@ -278,7 +264,6 @@ int main(int argc, char *argv[])
     } else if (disablePlugins) {
         LOG_INFO("Plugin initialization skipped (--no-plugins).");
     }
-
 
     // --- Initialization Result ---
     qint64 initTimeMs = initTimer.elapsed();
@@ -308,7 +293,7 @@ int main(int argc, char *argv[])
 
     QuantilyxDoc::MainWindow window; // MainWindow constructor should connect to core systems, potentially show its own progress
 
-    splash.finish(&window); // Hide splash screen when main window is shown and ready
+    splash.finish(&window); // Hide splash screen when main window is shown
     window.show(); // Make the main window visible
 
     splash.showMessage(QObject::tr("Ready"), Qt::AlignBottom | Qt::AlignHCenter, Qt::white);
@@ -370,11 +355,11 @@ int main(int argc, char *argv[])
 
     // --- Start the Qt Event Loop ---
     // This is where the application waits for and processes user input, system events, etc.
-    int returnCode = app.exec();
+    int result = app.exec();
 
     // --- Application Shutdown Sequence ---
     // Perform cleanup tasks before the application exits.
-    LOG_INFO("Shutting down QuantilyxDoc (exit code: " << returnCode << ")...");
+    LOG_INFO("Shutting down QuantilyxDoc (exit code: " << result << ")...");
 
     // Save application settings
     LOG_DEBUG("Saving application settings...");
@@ -384,42 +369,22 @@ int main(int argc, char *argv[])
     LOG_DEBUG("Saving recent files list...");
     QuantilyxDoc::RecentFiles::instance().save();
 
-    // Save current profile state (if applicable)
+    // Save current profile state
     LOG_DEBUG("Saving current profile...");
     // QuantilyxDoc::ProfileManager::instance().saveCurrentProfile(); // Assuming this method exists
 
     // Save metadata database changes (if any were made during the session)
     LOG_DEBUG("Committing metadata database changes...");
-    // QuantilyxDoc::MetadataDatabase::instance().commit(); // Assuming this flushes changes
+    // QuantilyxDoc::MetadataDatabase::instance().commit(); // Assuming this flushes changes to disk
 
     // Save full-text index changes (if any were made during the session)
     LOG_DEBUG("Committing full-text index changes...");
-    // QuantilyxDoc::FullTextIndex::instance().commit(); // Assuming this flushes changes
-
-    // Save duplicate detector state/cache (if applicable)
-    LOG_DEBUG("Saving duplicate detector state...");
-    // QuantilyxDoc::DuplicateDetector::instance().saveState(); // Assuming this method exists
+    // QuantilyxDoc::FullTextIndex::instance().commit(); // Assuming this flushes changes to disk
 
     // Uninstall the crash handler
     LOG_DEBUG("Uninstalling crash handler...");
     QuantilyxDoc::CrashHandler::instance().uninstall();
 
-    // Shut down OCR engine if necessary
-    LOG_DEBUG("Shutting down OcrEngine...");
-    // QuantilyxDoc::OcrEngine::instance().shutdown(); // Assuming a shutdown method exists
-
-    // Shut down scripting engine if necessary
-    LOG_DEBUG("Shutting down ScriptingEngine...");
-    // QuantilyxDoc::ScriptingEngine::instance().shutdown(); // Assuming a shutdown method exists
-
-    // Shut down macro recorder if necessary
-    LOG_DEBUG("Shutting down MacroRecorder...");
-    // QuantilyxDoc::MacroRecorder::instance().shutdown(); // Assuming a shutdown method exists
-
-    // Shut down plugins if necessary
-    LOG_DEBUG("Shutting down plugins...");
-    // app.shutdownPlugins(); // Hypothetical method in Application
-
     LOG_INFO("QuantilyxDoc shutdown sequence complete.");
-    return returnCode; // Return the exit code from QApplication::exec()
+    return result; // Return the exit code from QApplication::exec()
 }
